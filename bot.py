@@ -231,16 +231,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
     conn.commit()
     
     welcome_text = f"""
-🏪 *ДОБРО ПОЖАЛОВАТЬ В МАГАЗИН GAME-MARKET!* 🎮
+🏪 *ДОБРО ПОЖАЛОВАТЬ В МАГАЗИН Money Moves Bot | заработок!* 🎮
 
 👋 Привет, {user.first_name}!
 
 Мы покупаем:
-• 🎮 Игровые аккаунты (Steam, Epic Games, Origin)
-• 💎 Внутриигровые предметы (CS:GO, Dota 2, TF2)
-• 🎫 Игровые ключи (Steam, Xbox, PlayStation)
-• 📱 Цифровые подарки (Apple, Amazon, Google)
+• 🎮 Игровые аккаунты (Steam, Epic Games, Origin и др)
+• 💎 Внутриигровые предметы (CS:GO, Dota 2, TF2 и др)
+• 🎫 Игровые ключи (Steam, Xbox, PlayStation и др)
+• 📱 Цифровые подарки (Apple, Amazon, Google и др)
+• 🛬 Телеграмм подарки  
 • 💳 Электронные ваучеры
+
 
 💰 *Почему мы?*
 • Мгновенная оплата
@@ -253,9 +255,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")],
-        [InlineKeyboardButton(text="💬 ЧАТ С ПОДДЕРЖКОЙ", callback_data="support_chat")],
-        [InlineKeyboardButton(text="📊 МОИ ПРОДАЖИ", callback_data="my_sales")],
-        [InlineKeyboardButton(text="👑 СТАТУС АККАУНТА", callback_data="verify_account")]
+
     ])
     
     await message.answer(welcome_text, parse_mode="Markdown", reply_markup=keyboard)
