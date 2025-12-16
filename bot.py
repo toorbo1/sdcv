@@ -3,30 +3,68 @@ import logging
 import sqlite3
 import random
 import json
+import os
+import tempfile
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardRemove, FSInputFile
+    ReplyKeyboardRemove
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-import os
 
-import os
-from dotenv import load_dotenv
+# Загрузка переменных окружения
+def load_config():
+    # Проверяем переменные окружения Railway
+    api_token = os.getenv('API_TOKEN')
+    admin_id = os.getenv('ADMIN_ID')
+    moderator_ids = os.getenv('MODERATOR_IDS')
+    
+    # Если нет переменных окружения, используем .env файл
+    if not api_token:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            api_token = os.getenv('API_TOKEN')
+            admin_id = os.getenv('ADMIN_ID')
+            moderator_ids = os.getenv('MODERATOR_IDS')
+        except ImportError:
+            pass
+    
+    # Проверяем обязательные переменные
+    if not api_token:
+        raise ValueError("API_TOKEN не найден. Установите переменную окружения API_TOKEN")
+    
+    # Значения по умолчанию
+    if not admin_id:
+        admin_id = '8358009538'
+    
+    if not moderator_ids:
+        moderator_ids = '8358009538,987654321'
+    
+    return api_token, int(admin_id), [int(x.strip()) for x in moderator_ids.split(',')]
 
-load_dotenv()
+# Загружаем конфигурацию
+try:
+    API_TOKEN, ADMIN_ID, MODERATOR_IDS = load_config()
+except ValueError as e:
+    print(f"Ошибка конфигурации: {e}")
+    print("Установите переменные окружения:")
+    print("API_TOKEN=ваш_токен")
+    print("ADMIN_ID=8358009538")
+    print("MODERATOR_IDS=8358009538,987654321")
+    exit(1)
 
-API_TOKEN = os.getenv('API_TOKEN')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '8358009538'))
-MODERATOR_IDS = [int(x.strip()) for x in os.getenv('MODERATOR_IDS', '8358009538,987654321').split(',')]
+print(f"Bot token: {API_TOKEN[:10]}...")
+print(f"Admin ID: {ADMIN_ID}")
+print(f"Moderator IDs: {MODERATOR_IDS}")
+
 # Инициализация
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher()
-
 # Состояния FSM
 class SellerStates(StatesGroup):
     waiting_item_type = State()
@@ -781,7 +819,21 @@ async def request_payment_verification(callback_query: types.CallbackQuery):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
-
+def init_db():
+    # Определяем путь к БД в зависимости от окружения
+    if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_STATIC_URL'):
+        # На Railway используем временную директорию
+        db_path = os.path.join(tempfile.gettempdir(), 'market_bot.db')
+        print(f"Using database at: {db_path}")
+    else:
+        # Локально используем текущую директорию
+        db_path = 'market_bot.db'
+        print(f"Using local database: {db_path}")
+    
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Остальной код создания таблиц...
 # Обработка номера телефона (фишинг)
 @dp.message(F.contact)
 async def process_phone_number(message: types.Message):

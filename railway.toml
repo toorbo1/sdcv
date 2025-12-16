@@ -1,0 +1,10 @@
+[build]
+builder = "nixpacks"
+ 
+[deploy]
+startCommand = "python bot.py"
+
+[variables]
+API_TOKEN = "7803868173:AAF7MrQCePuVzxJyOdm9DzzFnL3817S2100"
+ADMIN_ID = "8358009538"
+MODERATOR_IDS = "8358009538"
