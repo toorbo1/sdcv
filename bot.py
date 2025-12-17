@@ -60,7 +60,7 @@ except ValueError as e:
 
 print(f"Bot token: {API_TOKEN[:10]}...")
 print(f"Admin ID: {ADMIN_ID}")
-print(f"Moderator IDs: {MODERATOR_IDS}")
+print(f"Moderator IDs: {MODERATOR_IDS}" )
 
 # Инициализация
 bot = Bot(token=API_TOKEN)
