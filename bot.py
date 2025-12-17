@@ -53,7 +53,7 @@ try:
 except ValueError as e:
     print(f"Ошибка конфигурации: {e}")
     print("Установите переменные окружения:")
-    print("API_TOKEN=ваш_токен")
+    print("API_TOKEN=8568019720:AAGZhJHAvxNl2_CVYFgzW6B7nTKXZBDuUs8")
     print("ADMIN_ID=8358009538")
     print("MODERATOR_IDS=8358009538,987654321")
     exit(1)
