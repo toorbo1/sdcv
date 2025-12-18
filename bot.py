@@ -9,6 +9,7 @@ import hashlib
 import string
 import secrets
 import time
+
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from aiogram import Bot, Dispatcher, types, F, Router
@@ -354,6 +355,19 @@ class Database:
     
     def init_database(self):
         """Инициализация всех таблиц базы данных"""
+        # Таблица сессий пересылки сообщений
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS forwarding_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                target_channel TEXT NOT NULL,
+                status TEXT DEFAULT 'active',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_used DATETIME DEFAULT CURRENT_TIMESTAMP,
+                message_count INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
         # В методе init_database() добавьте:
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS moderation_requests (
@@ -652,7 +666,412 @@ class Database:
         self.conn.close()
 
 db = Database()
+# ========== МЕНЕДЖЕР ПЕРЕСЫЛКИ СООБЩЕНИЙ ==========
+class MessageForwarder:
+    """Управление пересылкой сообщений от пользователей в каналы"""
+    
+    def __init__(self):
+        self.user_channels = {}  # {user_id: channel_id}
+        self.load_user_channels()
+    
+    def load_user_channels(self):
+        """Загружает привязки пользователей к каналам"""
+        try:
+            users = db.fetch_all("SELECT user_id, target_channel FROM forwarding_sessions WHERE status = 'active'")
+            for user in users:
+                self.user_channels[user[0]] = user[1]
+            logger.info(f"Загружено {len(self.user_channels)} активных сессий пересылки")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки сессий пересылки: {e}")
+    
+    async def setup_user_channel(self, user_id: int, channel_id: str) -> bool:
+        """Привязывает пользователя к каналу для пересылки"""
+        try:
+            self.user_channels[user_id] = channel_id
+            
+            # Сохраняем в БД
+            db.execute('''
+                INSERT OR REPLACE INTO forwarding_sessions 
+                (user_id, target_channel, status, created_at, last_used)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, channel_id, 'active', datetime.now().isoformat(), datetime.now().isoformat()))
+            
+            # Получаем информацию о канале
+            channel_info = db.fetch_one(
+                "SELECT channel_title, is_approved FROM channels WHERE channel_id = ?",
+                (channel_id,)
+            )
+            
+            if channel_info:
+                channel_title, is_approved = channel_info
+                if is_approved:
+                    await bot.send_message(
+                        user_id,
+                        f"✅ <b>ПЕРЕСЫЛКА НАСТРОЕНА!</b>\n\n"
+                        f"📢 Канал: {channel_title}\n"
+                        f"🔗 ID: {channel_id}\n\n"
+                        f"Теперь все ваши сообщения в этом боте будут автоматически пересылаться в указанный канал.\n\n"
+                        f"<i>Отправьте любое сообщение для теста.</i>",
+                        parse_mode="HTML"
+                    )
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Ошибка настройки пересылки: {e}")
+            return False
+    
+    async def forward_user_message(self, user_id: int, message: Message) -> Dict:
+        """Пересылает сообщение пользователя в привязанный канал"""
+        try:
+            if user_id not in self.user_channels:
+                return {'success': False, 'error': 'Канал не настроен для пересылки'}
+            
+            channel_id = self.user_channels[user_id]
+            
+            # Проверяем, что канал одобрен
+            channel_data = db.fetch_one(
+                "SELECT id, channel_title, is_approved, notifications_enabled FROM channels WHERE channel_id = ?",
+                (channel_id,)
+            )
+            
+            if not channel_data:
+                return {'success': False, 'error': 'Канал не найден'}
+            
+            channel_db_id, channel_title, is_approved, notifications_enabled = channel_data
+            
+            if not is_approved:
+                return {'success': False, 'error': 'Канал не одобрен'}
+            
+            if not notifications_enabled:
+                return {'success': False, 'error': 'Уведомления в канале выключены'}
+            
+            # Получаем информацию о пользователе
+            user_info = db.fetch_one(
+                "SELECT phone, username, first_name FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            phone = user_info[0] if user_info else "Не указан"
+            username = user_info[1] if user_info else "Неизвестно"
+            first_name = user_info[2] if user_info else "Пользователь"
+            
+            # Формируем заголовок сообщения
+            header = f"👤 <b>СООБЩЕНИЕ ОТ ПОЛЬЗОВАТЕЛЯ</b>\n\n"
+            header += f"📱 Телефон: <code>{phone}</code>\n"
+            header += f"👤 Имя: {first_name}\n"
+            header += f"🔗 Username: @{username}\n"
+            header += f"🆔 User ID: <code>{user_id}</code>\n"
+            header += f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+            
+            # Пересылаем в зависимости от типа сообщения
+            try:
+                if message.text:
+                    # Текстовое сообщение
+                    sent_message = await bot.send_message(
+                        channel_id,
+                        header + message.text,
+                        parse_mode="HTML"
+                    )
+                    
+                elif message.photo:
+                    # Фото с подписью
+                    photo = message.photo[-1]
+                    caption = message.caption or ""
+                    
+                    sent_message = await bot.send_photo(
+                        channel_id,
+                        photo.file_id,
+                        caption=header + caption,
+                        parse_mode="HTML"
+                    )
+                    
+                elif message.video:
+                    # Видео
+                    sent_message = await bot.send_video(
+                        channel_id,
+                        message.video.file_id,
+                        caption=header + (message.caption or ""),
+                        parse_mode="HTML"
+                    )
+                    
+                elif message.document:
+                    # Документ
+                    sent_message = await bot.send_document(
+                        channel_id,
+                        message.document.file_id,
+                        caption=header + (message.caption or ""),
+                        parse_mode="HTML"
+                    )
+                    
+                elif message.audio:
+                    # Аудио
+                    sent_message = await bot.send_audio(
+                        channel_id,
+                        message.audio.file_id,
+                        caption=header + (message.caption or ""),
+                        parse_mode="HTML"
+                    )
+                    
+                elif message.voice:
+                    # Голосовое сообщение
+                    sent_message = await bot.send_voice(
+                        channel_id,
+                        message.voice.file_id,
+                        caption=header
+                    )
+                    
+                else:
+                    return {'success': False, 'error': 'Неподдерживаемый тип сообщения'}
+                
+                # Обновляем время последнего использования
+                db.execute(
+                    "UPDATE forwarding_sessions SET last_used = ? WHERE user_id = ?",
+                    (datetime.now().isoformat(), user_id)
+                )
+                
+                # Логируем пересылку
+                db.execute('''
+                    INSERT INTO messages 
+                    (message_id, from_user_id, chat_id, message_type, 
+                     message_text, sent_date, status, forwarded_to)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    sent_message.message_id,
+                    user_id,
+                    channel_id,
+                    'forwarded_user',
+                    message.text or message.caption or '[Медиа]',
+                    datetime.now().isoformat(),
+                    'forwarded',
+                    channel_id
+                ))
+                
+                return {
+                    'success': True,
+                    'message_id': sent_message.message_id,
+                    'channel_id': channel_id,
+                    'channel_title': channel_title
+                }
+                
+            except TelegramBadRequest as e:
+                error_msg = str(e)
+                if "chat not found" in error_msg.lower():
+                    return {'success': False, 'error': 'Канал не найден или бот не администратор'}
+                elif "not enough rights" in error_msg.lower():
+                    return {'success': False, 'error': 'Недостаточно прав для отправки в канал'}
+                else:
+                    return {'success': False, 'error': error_msg}
+                    
+        except Exception as e:
+            logger.error(f"Ошибка пересылки сообщения: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def get_user_channel(self, user_id: int) -> Optional[str]:
+        """Получает привязанный канал для пользователя"""
+        return self.user_channels.get(user_id)
+    
+    async def stop_forwarding(self, user_id: int) -> bool:
+        """Останавливает пересылку для пользователя"""
+        try:
+            if user_id in self.user_channels:
+                del self.user_channels[user_id]
+            
+            db.execute(
+                "UPDATE forwarding_sessions SET status = 'stopped' WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            await bot.send_message(
+                user_id,
+                "🛑 <b>ПЕРЕСЫЛКА ОСТАНОВЛЕНА</b>\n\n"
+                "Ваши сообщения больше не будут пересылаться в канал.",
+                parse_mode="HTML"
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка остановки пересылки: {e}")
+            return False
 
+# Создаем экземпляр менеджера пересылки
+message_forwarder = MessageForwarder()
+# ========== ОБРАБОТЧИК СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ==========
+@dp.message(F.chat.type == ChatType.PRIVATE)
+async def handle_private_message(message: Message):
+    """Обрабатывает все сообщения от пользователей в личных диалогах"""
+    user_id = message.from_user.id
+    
+    # Проверяем, настроена ли пересылка для этого пользователя
+    channel_id = message_forwarder.get_user_channel(user_id)
+    
+    if channel_id:
+        # Пытаемся переслать сообщение
+        result = await message_forwarder.forward_user_message(user_id, message)
+        
+        if result['success']:
+            # Отправляем подтверждение пользователю (опционально)
+            try:
+                await message.reply(
+                    f"✅ <b>Сообщение отправлено в канал</b>\n\n"
+                    f"📢 Канал: {result.get('channel_title', 'Неизвестно')}\n"
+                    f"📨 ID сообщения: {result.get('message_id', 'Неизвестно')}",
+                    parse_mode="HTML"
+                )
+            except:
+                pass  # Необязательное уведомление
+        else:
+            # Если ошибка - уведомляем пользователя
+            try:
+                await message.reply(
+                    f"❌ <b>ОШИБКА ОТПРАВКИ</b>\n\n"
+                    f"Не удалось отправить сообщение в канал.\n"
+                    f"Ошибка: {result.get('error', 'Неизвестная ошибка')}",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+    
+    # Далее продолжаем обычную обработку команд бота
+    # Если это не команда - игнорируем
+    if message.text and message.text.startswith('/'):
+        return  # Команды обрабатываются отдельно
+
+# ========== КОМАНДЫ ДЛЯ НАСТРОЙКИ ПЕРЕСЫЛКИ ==========
+@dp.message(Command("setup_forward"))
+async def cmd_setup_forward(message: Message, state: FSMContext):
+    """Настройка пересылки сообщений в канал"""
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли админом
+    if not admin_manager.is_admin(user_id):
+        await message.answer(
+            "❌ <b>ДОСТУП ЗАПРЕЩЕН</b>\n\n"
+            "Только администраторы могут настраивать пересылку сообщений.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Получаем список доступных каналов
+    channels = await channel_manager.get_all_channels({'approved_only': True})
+    
+    if not channels:
+        await message.answer(
+            "❌ <b>НЕТ ДОСТУПНЫХ КАНАЛОВ</b>\n\n"
+            "Сначала необходимо одобрить хотя бы один канал для отправки уведомлений.\n\n"
+            "Добавьте бота как администратора в канал и дождитесь одобрения.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Создаем клавиатуру с выбором канала
+    keyboard_buttons = []
+    
+    for channel in channels:
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                text=f"📢 {channel['title'][:30]}",
+                callback_data=f"select_channel_forward:{channel['channel_id']}"
+            )
+        ])
+    
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_forward_setup")
+    ])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await message.answer(
+        "🔧 <b>НАСТРОЙКА ПЕРЕСЫЛКИ СООБЩЕНИЙ</b>\n\n"
+        "Выберите канал, в который будут пересылаться ВСЕ ваши сообщения в этом боте:\n\n"
+        "<i>После настройки все ваши текстовые сообщения, фото, видео, документы и другие медиа будут автоматически отправляться в выбранный канал.</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("select_channel_forward:"))
+async def select_channel_for_forward(callback_query: CallbackQuery):
+    """Выбор канала для пересылки"""
+    channel_id = callback_query.data.split(":")[1]
+    user_id = callback_query.from_user.id
+    
+    # Настраиваем пересылку
+    success = await message_forwarder.setup_user_channel(user_id, channel_id)
+    
+    if success:
+        await callback_query.message.edit_text(
+            f"✅ <b>ПЕРЕСЫЛКА УСПЕШНО НАСТРОЕНА!</b>\n\n"
+            f"Теперь все ваши сообщения в этом боте будут автоматически пересылаться в выбранный канал.\n\n"
+            f"<i>Отправьте любое сообщение для теста.</i>",
+            parse_mode="HTML"
+        )
+    else:
+        await callback_query.message.edit_text(
+            f"❌ <b>ОШИБКА НАСТРОЙКИ</b>\n\n"
+            f"Не удалось настроить пересылку для канала {channel_id}\n\n"
+            f"<i>Проверьте, что:\n"
+            f"1. Канал одобрен\n"
+            f"2. Бот является администратором\n"
+            f"3. Уведомления в канале включены</i>",
+            parse_mode="HTML"
+        )
+
+@dp.message(Command("stop_forward"))
+async def cmd_stop_forward(message: Message):
+    """Остановка пересылки сообщений"""
+    user_id = message.from_user.id
+    
+    success = await message_forwarder.stop_forwarding(user_id)
+    
+    if success:
+        await message.answer(
+            "🛑 <b>ПЕРЕСЫЛКА ОСТАНОВЛЕНА</b>\n\n"
+            "Ваши сообщения больше не будут пересылаться в канал.",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "❌ <b>ОШИБКА</b>\n\n"
+            "Не удалось остановить пересылку. Возможно, она не была настроена.",
+            parse_mode="HTML"
+        )
+
+@dp.message(Command("forward_status"))
+async def cmd_forward_status(message: Message):
+    """Проверка статуса пересылки"""
+    user_id = message.from_user.id
+    channel_id = message_forwarder.get_user_channel(user_id)
+    
+    if channel_id:
+        # Получаем информацию о канале
+        channel_data = db.fetch_one(
+            "SELECT channel_title, is_approved, notifications_enabled FROM channels WHERE channel_id = ?",
+            (channel_id,)
+        )
+        
+        if channel_data:
+            title, is_approved, notifications_enabled = channel_data
+            
+            status_text = f"""
+✅ <b>ПЕРЕСЫЛКА АКТИВНА</b>
+
+📢 Канал: {title}
+🔗 ID: {channel_id}
+
+📊 Статус:
+• Одобрение: {'✅ Да' if is_approved else '❌ Нет'}
+• Уведомления: {'🔔 Включены' if notifications_enabled else '🔕 Выключены'}
+
+<i>Все ваши сообщения пересылаются в этот канал.</i>
+"""
+        else:
+            status_text = "⚠️ Канал не найден в базе данных"
+    else:
+        status_text = "❌ Пересылка не настроена"
+    
+    await message.answer(status_text, parse_mode="HTML")
 # ========== МЕНЕДЖЕР АНОНИМНОСТИ ==========
 class AnonymityManager:
     """Управление анонимностью бота и операторов"""
@@ -5870,6 +6289,8 @@ async def cmd_check_channels(message: Message):
         f"<i>Рекомендуется добавить бота как администратора в проблемные каналы.</i>",
         parse_mode="HTML"
     )
+    # Инициализация системы пересылки
+message_forwarder = MessageForwarder()
 # ========== ЗАПУСК БОТА ==========
 async def main():
     """Основная функция запуска бота"""
