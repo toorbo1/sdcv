@@ -4,6 +4,32 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python bot.py"
+    "startCommand": "python bot.py",
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 10
+  },
+  "env": {
+    "API_TOKEN": {
+      "description": "Токен бота Telegram от @BotFather",
+      "required": true
+    },
+    "ADMIN_ID": {
+      "description": "ID администратора (ваш Telegram ID)",
+      "value": "8358009538",
+      "required": true
+    },
+    "MODERATOR_IDS": {
+      "description": "ID модераторов через запятую",
+      "value": "8358009538",
+      "required": true
+    },
+    "TELEGRAM_API_ID": {
+      "description": "API ID из my.telegram.org",
+      "required": true
+    },
+    "TELEGRAM_API_HASH": {
+      "description": "API Hash из my.telegram.org",
+      "required": true
+    }
   }
 }

