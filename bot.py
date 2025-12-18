@@ -79,6 +79,9 @@ from aiogram.types import (
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.enums import ChatType
+from aiogram.types import Message, ChatMemberUpdated, ChatJoinRequest
+
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -4508,6 +4511,64 @@ async def check_bot_permissions_task():
             await asyncio.sleep(300)
 
             
+# Обработчик сообщений из групп (супергрупп и обычных групп)
+@dp.message(F.chat.type.in_({ChatType.SUPERGROUP, ChatType.GROUP}))
+async def handle_group_message(message: Message):
+    """
+    Обрабатывает сообщения от пользователей в группах.
+    Важно: Бот получит это сообщение только если он является администратором
+    и если сообщение отправлено от конкретного пользователя (message.from_user не None).
+    """
+    # Проверяем, что сообщение от пользователя, а не от канала или системы
+    if not message.from_user:
+        return
+
+    # Логируем полученное сообщение
+    logger.info(f"Сообщение в группе '{message.chat.title}' от @{message.from_user.username}: {message.text}")
+
+    # Здесь можно добавить логику обработки
+    # Например, проверка на команду или пересылка в другой чат
+    # await bot.send_message(YOUR_ADMIN_CHAT_ID, f"Группа: {message.chat.title}\nПользователь: @{message.from_user.username}\nСообщение: {message.text}")
+
+# Обработчик постов в каналах
+@dp.channel_post()
+async def handle_channel_post(post: Message):
+    """
+    Обрабатывает посты, сделанные непосредственно в канале.
+    Для сообщений в обсуждениях каналов используйте фильтр `is_automatic_forward`.
+    """
+    # Бот получает этот пост, только если он админ канала
+    logger.info(f"Пост в канале '{post.chat.title}': {post.text or 'Медиа-контент'}")
+
+    # Пример: переслать пост в админский чат
+    # try:
+    #     await bot.forward_message(chat_id=config.MAIN_ADMIN_ID, from_chat_id=post.chat.id, message_id=post.message_id)
+    # except Exception as e:
+    #     logger.error(f"Не удалось переслать пост: {e}")
+
+# Обработчик пересланных в группу обсуждений сообщений из канала
+@dp.message(F.is_automatic_forward == True)
+async def handle_forwarded_from_channel(message: Message):
+    """
+    Обрабатывает сообщения, автоматически пересланные из канала в подключенную группу обсуждений[citation:5].
+    Это ключевой момент для получения уведомлений о новых сообщениях от пользователей в каналах.
+    """
+    if message.forward_origin and message.forward_origin.type == "channel":
+        # Логируем пересланное из канала сообщение
+        logger.info(f"Автопересылка из канала в группу обсуждений '{message.chat.title}': {message.text}")
+
+        # Ваша логика обработки...
+        # Это событие можно использовать для уведомления о новом сообщении пользователя в канале
+
+# Обработчик события "бота добавили в чат" (УЖЕ ЕСТЬ У ВАС, но важно проверить)
+@dp.my_chat_member()
+async def on_bot_added_to_chat(update: ChatMemberUpdated):
+    """
+    Обрабатывает событие изменения статуса бота в чате.
+    Критически важно для отслеживания, когда бота делают администратором.
+    """
+    # Ваш существующий код здесь...
+    # Убедитесь, что он правильно обновляет статус в БД и проверяет права.
             
 async def check_channels_status_task():
     """Периодически проверяет статус бота в каналах"""
