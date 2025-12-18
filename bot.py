@@ -4492,8 +4492,23 @@ async def start_background_tasks():
     # Запускаем проверку статуса бота в каналах
     asyncio.create_task(check_channels_status_task())
     
+    # Запускаем проверку прав бота
+    asyncio.create_task(check_bot_permissions_task())
+    
     logger.info("Фоновые задачи запущены")
 
+async def check_bot_permissions_task():
+    """Периодическая проверка прав бота"""
+    while True:
+        try:
+            await check_bot_permissions_in_channels()
+            await asyncio.sleep(1800)  # Проверка каждые 30 минут
+        except Exception as e:
+            logger.error(f"Ошибка проверки прав бота: {e}")
+            await asyncio.sleep(300)
+
+            
+            
 async def check_channels_status_task():
     """Периодически проверяет статус бота в каналах"""
     while True:
@@ -4548,6 +4563,360 @@ async def check_channels_status_task():
         except Exception as e:
             logger.error(f"Ошибка в задаче проверки статуса каналов: {e}")
             await asyncio.sleep(300)
+
+
+# ========== ОБРАБОТЧИК СООБЩЕНИЙ ИЗ КАНАЛОВ/ГРУПП ==========
+@dp.message(F.chat.type.in_([ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]))
+async def handle_channel_message(message: Message):
+    """Обрабатывает сообщения из каналов и групп"""
+    try:
+        chat_id = message.chat.id
+        user_id = message.from_user.id if message.from_user else None
+        message_id = message.message_id
+        
+        # Проверяем, отслеживается ли этот канал
+        channel_data = db.fetch_one(
+            "SELECT id, is_approved, notifications_enabled, admin_notifications FROM channels WHERE channel_id = ?",
+            (str(chat_id),)
+        )
+        
+        if not channel_data:
+            # Канал не в базе - игнорируем
+            return
+        
+        channel_db_id, is_approved, notifications_enabled, admin_notifications = channel_data
+        
+        # Если канал одобрен и включены уведомления - обрабатываем
+        if is_approved and notifications_enabled:
+            # Логируем сообщение
+            message_type = 'text'
+            media_path = None
+            
+            if message.photo:
+                message_type = 'photo'
+                # Сохраняем фото
+                photo = message.photo[-1]
+                file_info = await bot.get_file(photo.file_id)
+                media_path = f"media/channel_{chat_id}_{message_id}.jpg"
+                await bot.download_file(file_info.file_path, media_path)
+            elif message.video:
+                message_type = 'video'
+                file_info = await bot.get_file(message.video.file_id)
+                media_path = f"media/channel_{chat_id}_{message_id}.mp4"
+                await bot.download_file(file_info.file_path, media_path)
+            elif message.document:
+                message_type = 'document'
+                file_info = await bot.get_file(message.document.file_id)
+                ext = message.document.file_name.split('.')[-1] if message.document.file_name else 'bin'
+                media_path = f"media/channel_{chat_id}_{message_id}.{ext}"
+                await bot.download_file(file_info.file_path, media_path)
+            
+            # Сохраняем в базу
+            db.execute('''
+                INSERT INTO messages 
+                (message_id, chat_id, from_user_id, message_type, message_text, 
+                 media_path, sent_date, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                message_id,
+                chat_id,
+                user_id,
+                message_type,
+                message.text or message.caption or '',
+                media_path,
+                datetime.now().isoformat(),
+                'received'
+            ))
+            
+            # Если включены админ-уведомления - отправляем админу
+            if admin_notifications:
+                channel_info = db.fetch_one(
+                    "SELECT channel_title FROM channels WHERE id = ?",
+                    (channel_db_id,)
+                )
+                channel_title = channel_info[0] if channel_info else f"Канал {chat_id}"
+                
+                preview_text = message.text or message.caption or '[Медиа-сообщение]'
+                preview_text = preview_text[:200] + '...' if len(preview_text) > 200 else preview_text
+                
+                await bot.send_message(
+                    config.MAIN_ADMIN_ID,
+                    f"📨 <b>НОВОЕ СООБЩЕНИЕ ИЗ КАНАЛА</b>\n\n"
+                    f"📢 Канал: {channel_title}\n"
+                    f"🔗 ID: {chat_id}\n"
+                    f"👤 Отправитель: {user_id or 'Система'}\n"
+                    f"📝 Сообщение: {preview_text}\n"
+                    f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
+                    parse_mode="HTML"
+                )
+                
+    except Exception as e:
+        logger.error(f"Ошибка обработки сообщения из канала: {e}")
+
+# ========== ОБРАБОТЧИК КОМАНД В КАНАЛАХ ==========
+@dp.message(Command("help", "info", "status", prefix="/"))
+async def handle_channel_commands(message: Message):
+    """Обрабатывает команды в каналах"""
+    chat_type = message.chat.type
+    
+    if chat_type in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]:
+        # Проверяем права бота
+        try:
+            member = await bot.get_chat_member(message.chat.id, (await bot.get_me()).id)
+            if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+                
+                if message.text == "/help":
+                    help_text = """
+🤖 <b>КОМАНДЫ БОТА В КАНАЛЕ:</b>
+
+/help - Эта справка
+/status - Статус бота в канале
+/settings - Настройки уведомлений
+/test - Тестовая отправка
+
+<b>Для администраторов:</b>
+/approve - Одобрить канал
+/notify - Отправить уведомление
+                    """
+                    await message.reply(help_text, parse_mode="HTML")
+                    
+                elif message.text == "/status":
+                    # Получаем статус канала
+                    channel_data = db.fetch_one(
+                        "SELECT is_approved, notifications_enabled FROM channels WHERE channel_id = ?",
+                        (str(message.chat.id),)
+                    )
+                    
+                    if channel_data:
+                        is_approved, notifications_enabled = channel_data
+                        status_text = f"""
+📊 <b>СТАТУС БОТА В КАНАЛЕ:</b>
+
+✅ Бот активен как администратор
+📢 Канал: {message.chat.title}
+🔗 ID: {message.chat.id}
+
+<b>Статус:</b>
+• Одобрение: {'✅ Одобрен' if is_approved else '⏳ Ожидает'}
+• Уведомления: {'🔔 Включены' if notifications_enabled else '🔕 Выключены'}
+
+<b>Команды:</b>
+Используйте /help для списка команд
+                        """
+                    else:
+                        status_text = "❌ Канал не зарегистрирован в системе. Добавьте бота как администратора."
+                    
+                    await message.reply(status_text, parse_mode="HTML")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка обработки команды в канале: {e}")
+
+# ========== КОМАНДА ДЛЯ ТЕСТА УВЕДОМЛЕНИЙ В КАНАЛЕ ==========
+@dp.message(Command("test"))
+async def cmd_test_channel(message: Message):
+    """Тестовая отправка в текущий канал"""
+    chat_id = message.chat.id
+    
+    # Проверяем, является ли канал
+    if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]:
+        await message.reply("❌ Эта команда работает только в каналах и группах")
+        return
+    
+    # Проверяем права бота
+    try:
+        member = await bot.get_chat_member(chat_id, (await bot.get_me()).id)
+        if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            await message.reply("❌ Бот должен быть администратором для отправки сообщений")
+            return
+    except:
+        await message.reply("❌ Не удалось проверить права бота")
+        return
+    
+    # Проверяем, есть ли канал в базе
+    channel_data = db.fetch_one(
+        "SELECT id, is_approved FROM channels WHERE channel_id = ?",
+        (str(chat_id),)
+    )
+    
+    if not channel_data:
+        await message.reply(
+            "❌ Канал не зарегистрирован в системе.\n\n"
+            "Для регистрации:\n"
+            "1. Убедитесь, что бот добавлен как администратор\n"
+            "2. Главный администратор должен одобрить канал\n"
+            "3. После одобрения можно отправлять уведомления"
+        )
+        return
+    
+    channel_db_id, is_approved = channel_data
+    
+    if not is_approved:
+        await message.reply("⏳ Канал ожидает одобрения главного администратора")
+        return
+    
+    # Отправляем тестовое сообщение
+    test_message = (
+        "✅ <b>ТЕСТОВОЕ УВЕДОМЛЕНИЕ</b>\n\n"
+        "Это тестовое сообщение подтверждает, что:\n"
+        "• Бот работает как администратор\n"
+        "• Канал одобрен для уведомлений\n"
+        "• Система уведомлений активна\n\n"
+        f"📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+    )
+    
+    result = await channel_manager.send_to_channel(
+        channel_db_id,
+        test_message,
+        message_type='test'
+    )
+    
+    if result['success']:
+        await message.reply("✅ Тестовое сообщение отправлено в канал")
+    else:
+        await message.reply(f"❌ Ошибка отправки: {result.get('error', 'Неизвестная ошибка')}")
+
+# ========== КОМАНДА ДЛЯ НАСТРОЙКИ УВЕДОМЛЕНИЙ В КАНАЛЕ ==========
+@dp.message(Command("settings"))
+async def cmd_channel_settings(message: Message):
+    """Настройки уведомлений в текущем канале"""
+    chat_id = message.chat.id
+    
+    if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL]:
+        await message.reply("❌ Эта команда работает только в каналах и группах")
+        return
+    
+    # Проверяем права отправителя
+    try:
+        member = await bot.get_chat_member(chat_id, message.from_user.id)
+        if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            await message.reply("❌ Только администраторы канала могут изменять настройки")
+            return
+    except:
+        await message.reply("❌ Не удалось проверить ваши права")
+        return
+    
+    # Получаем данные канала
+    channel_data = db.fetch_one(
+        """SELECT id, channel_title, is_approved, notifications_enabled, 
+           admin_notifications FROM channels WHERE channel_id = ?""",
+        (str(chat_id),)
+    )
+    
+    if not channel_data:
+        await message.reply("❌ Канал не найден в базе данных")
+        return
+    
+    channel_db_id, title, is_approved, notif_enabled, admin_notif = channel_data
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"{'🔕 Отключить' if notif_enabled else '🔔 Включить'} уведомления",
+                callback_data=f"quick_toggle_notif:{channel_db_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'👁️ Скрыть' if admin_notif else '👁️ Показывать'} админу",
+                callback_data=f"quick_toggle_admin:{channel_db_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="📊 Подробные настройки", callback_data=f"channel_settings:{channel_db_id}"),
+            InlineKeyboardButton(text="❌ Закрыть", callback_data="close_menu")
+        ]
+    ])
+    
+    status_text = "✅ Одобрен" if is_approved else "⏳ Ожидает одобрения"
+    notif_text = "🔔 Включены" if notif_enabled else "🔕 Выключены"
+    admin_notif_text = "👁️ Показываются админу" if admin_notif else "👁️ Скрыты от админа"
+    
+    await message.reply(
+        f"⚙️ <b>НАСТРОЙКИ КАНАЛА</b>\n\n"
+        f"📢 Канал: {title}\n"
+        f"🔗 ID: {chat_id}\n\n"
+        f"📊 Статус:\n"
+        f"• {status_text}\n"
+        f"• {notif_text}\n"
+        f"• {admin_notif_text}\n\n"
+        f"<i>Выберите действие:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("quick_toggle_notif:"))
+async def quick_toggle_notifications(callback_query: CallbackQuery):
+    """Быстрое переключение уведомлений"""
+    channel_db_id = int(callback_query.data.split(":")[1])
+    
+    result = await channel_manager.toggle_channel_notifications(channel_db_id)
+    
+    if result['success']:
+        await callback_query.answer(result['message'])
+        await callback_query.message.delete()
+    else:
+        await callback_query.answer(f"❌ Ошибка: {result.get('error', 'Неизвестная ошибка')}")
+
+@dp.callback_query(F.data.startswith("quick_toggle_admin:"))
+async def quick_toggle_admin_notifications(callback_query: CallbackQuery):
+    """Быстрое переключение админ-уведомлений"""
+    channel_db_id = int(callback_query.data.split(":")[1])
+    
+    result = await channel_manager.toggle_admin_notifications(channel_db_id)
+    
+    if result['success']:
+        await callback_query.answer(result['message'])
+        await callback_query.message.delete()
+    else:
+        await callback_query.answer(f"❌ Ошибка: {result.get('error', 'Неизвестная ошибка')}")
+
+async def check_bot_permissions_in_channels():
+    """Проверяет права бота во всех каналах"""
+    try:
+        channels = db.fetch_all(
+            "SELECT id, channel_id, channel_title FROM channels WHERE is_approved = 1"
+        )
+        
+        for channel in channels:
+            channel_db_id, channel_id, title = channel
+            
+            try:
+                # Проверяем права
+                member = await bot.get_chat_member(channel_id, (await bot.get_me()).id)
+                
+                permissions = {}
+                if member.status == ChatMemberStatus.ADMINISTRATOR:
+                    permissions = {
+                        'can_post_messages': member.can_post_messages or False,
+                        'can_edit_messages': member.can_edit_messages or False,
+                        'can_delete_messages': member.can_delete_messages or False,
+                        'can_pin_messages': member.can_pin_messages or False
+                    }
+                
+                # Обновляем в базе
+                db.execute(
+                    "UPDATE channels SET bot_permissions = ?, bot_is_admin = ? WHERE id = ?",
+                    (json.dumps(permissions), 1 if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR] else 0, channel_db_id)
+                )
+                
+                # Если бот больше не админ - уведомляем
+                if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+                    logger.warning(f"Бот больше не админ в канале {title}")
+                    
+                    await bot.send_message(
+                        config.MAIN_ADMIN_ID,
+                        f"⚠️ <b>БОТ УДАЛЕН ИЗ АДМИНИСТРАТОРОВ</b>\n\n"
+                        f"📢 Канал: {title}\n"
+                        f"🔗 ID: {channel_id}\n\n"
+                        f"Бот больше не может отправлять уведомления в этот канал.",
+                        parse_mode="HTML"
+                    )
+                
+            except Exception as e:
+                logger.error(f"Ошибка проверки прав в канале {channel_id}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Ошибка проверки прав бота: {e}")
 
 # ========== ОБРАБОТЧИК КНОПКИ НАЗАД ==========
 @dp.callback_query(F.data == "back_to_main")
@@ -4638,7 +5007,30 @@ async def errors_handler(update: types.Update, exception: Exception):
     except Exception as e:
         logger.error(f"Ошибка в обработчике ошибок: {e}")
         return True
-
+@dp.message(Command("check_channels"))
+async def cmd_check_channels(message: Message):
+    """Проверка всех каналов"""
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде")
+        return
+    
+    await message.answer("⏳ Проверяю права бота во всех каналах...")
+    
+    await check_bot_permissions_in_channels()
+    
+    # Получаем статистику
+    total = db.fetch_one("SELECT COUNT(*) FROM channels WHERE is_approved = 1")[0] or 0
+    bot_admin = db.fetch_one("SELECT COUNT(*) FROM channels WHERE bot_is_admin = 1 AND is_approved = 1")[0] or 0
+    
+    await message.answer(
+        f"✅ <b>ПРОВЕРКА ЗАВЕРШЕНА</b>\n\n"
+        f"📊 Результаты:\n"
+        f"• Всего одобренных каналов: {total}\n"
+        f"• Бот является админом: {bot_admin}\n"
+        f"• Проблемных каналов: {total - bot_admin}\n\n"
+        f"<i>Рекомендуется добавить бота как администратора в проблемные каналы.</i>",
+        parse_mode="HTML"
+    )
 # ========== ЗАПУСК БОТА ==========
 async def main():
     """Основная функция запуска бота"""
