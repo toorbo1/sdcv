@@ -2,5 +2,15 @@ aiogram==3.23.0
 telethon==1.42.0
 pyrogram==2.0.106
 python-dotenv==1.0.1
+tgcrypto==1.2.5
+redis==5.0.6
 aiohttp>=3.8.0
 aiohttp_socks>=0.8.0
+cryptography>=42.0.5
+phonenumbers>=8.13.30
+qrcode>=7.4.2
+fake-useragent>=1.4.0
+cloudscraper>=1.2.71
+selenium>=4.18.1
+undetected-chromedriver>=3.5.5
+nest-asyncio>=1.6.0
