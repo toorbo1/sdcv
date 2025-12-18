@@ -27,6 +27,5 @@ COPY . .
 RUN mkdir -p sessions media logs
 
 # Патч для исправления импорта
-RUN sed -i 's/from aiogram.client.default import DefaultBotProperties/# from aiogram.client.default import DefaultBotProperties/' /app/bot.py
 
 CMD ["python", "bot.py"]

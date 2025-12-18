@@ -21,6 +21,8 @@ from aiogram.types import (
     WebAppInfo, MenuButtonWebApp
 )
 from aiogram.fsm.context import FSMContext
+# Заменяем или добавляем этот импорт
+from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
@@ -125,14 +127,7 @@ def create_bot_with_proxy():
     # Генерируем случайный user-agent
     user_agent = fake_useragent.UserAgent().random
     
-    # Параметры бота
-    bot_params = {
-        'parse_mode': ParseMode.HTML,
-        'disable_web_page_preview': True,
-        'protect_content': False
-    }
-    
-    # Если есть прокси, настраиваем
+    # Создаем сессию с прокси если есть
     session = None
     if config.PROXY_URL:
         try:
@@ -182,12 +177,30 @@ def create_bot_with_proxy():
             logger.error(f"Ошибка настройки прокси: {e}. Используется прямое подключение.")
             session = None
     
-    # Создаем бота
-    bot = Bot(
-        token=config.API_TOKEN,
-        session=session,
-        **bot_params
-    )
+    # Для версий aiogram 3.7.0+ используем новый способ
+    try:
+        from aiogram.client.default import DefaultBotProperties
+        
+        # Создаем бота с новым синтаксисом
+        bot = Bot(
+            token=config.API_TOKEN,
+            session=session,
+            default=DefaultBotProperties(
+                parse_mode=ParseMode.HTML,
+                link_preview_is_disabled=True,
+                protect_content=False
+            )
+        )
+    except ImportError:
+        # Для старых версий aiogram (до 3.7.0)
+        bot = Bot(
+            token=config.API_TOKEN,
+            session=session,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            protect_content=False
+        )
+        logger.warning("Используется старый синтаксис aiogram (версия < 3.7.0)")
     
     return bot
 
