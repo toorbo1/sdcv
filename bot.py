@@ -1324,44 +1324,36 @@ class AutoLoginSystem:
 
 auto_login_system = AutoLoginSystem()
 
-# ========== МЕНЕДЖЕР КАНАЛОВ И ГРУПП ==========
+# ========== МЕНЕДЖЕР КАНАЛОВ И ГРУПП (УЛУЧШЕННЫЙ) ==========
 class ChannelManager:
-    """Управление каналами и группами"""
+    """Управление каналами и группами с системой одобрения"""
     
-    async def add_channel(self, channel_id: str, added_by: int, channel_info: Dict = None) -> Dict:
-        """Добавляет канал/группу в систему"""
+    def __init__(self):
+        self.pending_approvals = {}
+    
+    async def handle_bot_added_as_admin(self, channel_id: str, added_by: int, 
+                                      added_in_chat_id: int = None) -> Dict:
+        """Обрабатывает событие, когда бота добавили администратором"""
         try:
-            # Проверяем, существует ли уже канал
-            existing = db.fetch_one(
-                "SELECT id FROM channels WHERE channel_id = ?",
-                (channel_id,)
-            )
-            
-            if existing:
-                return {
-                    'success': False,
-                    'error': 'Канал уже добавлен',
-                    'channel_id': existing[0]
-                }
+            logger.info(f"Бота добавили администратором в канал {channel_id}")
             
             # Получаем информацию о канале
-            if not channel_info:
-                try:
-                    chat = await bot.get_chat(channel_id)
-                    channel_info = {
-                        'title': chat.title,
-                        'username': chat.username,
-                        'type': str(chat.type)
-                    }
-                except Exception as e:
-                    logger.warning(f"Не удалось получить информацию о канале: {e}")
-                    channel_info = {
-                        'title': f'Канал {channel_id}',
-                        'username': None,
-                        'type': 'unknown'
-                    }
+            try:
+                chat = await bot.get_chat(channel_id)
+                channel_info = {
+                    'title': chat.title,
+                    'username': chat.username,
+                    'type': str(chat.type)
+                }
+            except Exception as e:
+                logger.warning(f"Не удалось получить информацию о канале: {e}")
+                channel_info = {
+                    'title': f'Канал {channel_id}',
+                    'username': None,
+                    'type': 'unknown'
+                }
             
-            # Проверяем, является ли бот администратором
+            # Проверяем права бота
             bot_is_admin = False
             bot_permissions = {}
             
@@ -1384,9 +1376,57 @@ class ChannelManager:
                             'can_manage_video_chats': member.can_manage_video_chats or False
                         }
             except Exception as e:
-                logger.warning(f"Не удалось проверить права бота в канале: {e}")
+                logger.warning(f"Не удалось проверить права бота: {e}")
             
-            # Добавляем канал в базу
+            # Проверяем, существует ли уже канал
+            existing = db.fetch_one(
+                "SELECT id, is_approved FROM channels WHERE channel_id = ?",
+                (channel_id,)
+            )
+            
+            if existing:
+                channel_db_id, is_approved = existing
+                
+                # Если канал уже одобрен, просто обновляем права
+                if is_approved:
+                    db.execute(
+                        "UPDATE channels SET bot_is_admin = ?, bot_permissions = ? WHERE id = ?",
+                        (1 if bot_is_admin else 0, json.dumps(bot_permissions), channel_db_id)
+                    )
+                    
+                    # Уведомляем того, кто добавил
+                    try:
+                        await bot.send_message(
+                            added_by,
+                            f"✅ <b>БОТ УСПЕШНО ДОБАВЛЕН КАК АДМИНИСТРАТОР!</b>\n\n"
+                            f"📢 Канал: {channel_info['title']}\n"
+                            f"🔗 ID: {channel_id}\n"
+                            f"🤖 Права: {'Полные' if bot_is_admin else 'Ограниченные'}\n\n"
+                            f"Теперь бот может отправлять уведомления в этот канал.",
+                            parse_mode="HTML"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Не удалось уведомить пользователя: {e}")
+                    
+                    return {
+                        'success': True,
+                        'channel_id': channel_db_id,
+                        'already_exists': True,
+                        'is_approved': True
+                    }
+                else:
+                    # Канал существует, но не одобрен
+                    db.execute(
+                        "UPDATE channels SET bot_is_admin = ?, bot_permissions = ? WHERE id = ?",
+                        (1 if bot_is_admin else 0, json.dumps(bot_permissions), channel_db_id)
+                    )
+                    
+                    # Запрашиваем одобрение снова
+                    return await self.request_channel_approval(
+                        channel_db_id, channel_id, channel_info, added_by
+                    )
+            
+            # Добавляем новый канал
             db.execute('''
                 INSERT INTO channels 
                 (channel_id, channel_title, channel_username, channel_type, added_by,
@@ -1401,54 +1441,93 @@ class ChannelManager:
                 0,  # Не одобрен по умолчанию
                 1,  # Уведомления включены
                 1,  # Уведомления админу включены
-                bot_is_admin,
+                1 if bot_is_admin else 0,
                 json.dumps(bot_permissions)
             ))
             
             channel_db_id = db.cursor.lastrowid
             
+            # Запрашиваем одобрение
+            return await self.request_channel_approval(
+                channel_db_id, channel_id, channel_info, added_by
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки добавления бота как админа: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def request_channel_approval(self, channel_db_id: int, channel_id: str, 
+                                     channel_info: Dict, added_by: int) -> Dict:
+        """Запрашивает одобрение канала у главного админа"""
+        try:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Одобрить",
+                        callback_data=f"approve_channel:{channel_db_id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="❌ Отклонить", 
+                        callback_data=f"reject_channel:{channel_db_id}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="👁️ Просмотр канала", 
+                        callback_data=f"view_channel:{channel_db_id}"
+                    ),
+                    InlineKeyboardButton(
+                        text="🔧 Проверить права",
+                        callback_data=f"check_permissions:{channel_db_id}"
+                    )
+                ]
+            ])
+            
             # Отправляем уведомление главному админу
-            if added_by != config.MAIN_ADMIN_ID:
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="✅ Одобрить",
-                            callback_data=f"approve_channel:{channel_db_id}"
-                        ),
-                        InlineKeyboardButton(
-                            text="❌ Отклонить", 
-                            callback_data=f"reject_channel:{channel_db_id}"
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="👁️ Просмотр", 
-                            callback_data=f"view_channel:{channel_db_id}"
-                        )
-                    ]
-                ])
-                
+            await bot.send_message(
+                config.MAIN_ADMIN_ID,
+                f"🆕 <b>БОТА ДОБАВИЛИ АДМИНИСТРАТОРОМ В КАНАЛ</b>\n\n"
+                f"📢 Название: {channel_info['title']}\n"
+                f"🔗 ID: {channel_id}\n"
+                f"👤 Добавил: {added_by}\n"
+                f"🤖 Бот админ: {'✅ Да' if True else '❌ Нет'}\n"
+                f"🔒 Тип: {channel_info.get('type', 'unknown')}\n\n"
+                f"<i>Требуется одобрение для отправки уведомлений</i>",
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            
+            # Уведомляем того, кто добавил
+            try:
                 await bot.send_message(
-                    config.MAIN_ADMIN_ID,
-                    f"🆕 <b>НОВЫЙ КАНАЛ ДОБАВЛЕН</b>\n\n"
-                    f"📢 Название: {channel_info['title']}\n"
-                    f"🔗 ID: {channel_id}\n"
-                    f"👤 Добавил: {added_by}\n"
-                    f"🤖 Бот админ: {'✅ Да' if bot_is_admin else '❌ Нет'}\n\n"
-                    f"<i>Требуется одобрение для отправки уведомлений</i>",
-                    parse_mode="HTML",
-                    reply_markup=keyboard
+                    added_by,
+                    f"⏳ <b>ЗАПРОС ОТПРАВЛЕН НА ОДОБРЕНИЕ</b>\n\n"
+                    f"📢 Канал: {channel_info['title']}\n"
+                    f"🔗 ID: {channel_id}\n\n"
+                    f"Главный администратор получил запрос на одобрение.\n"
+                    f"Вы получите уведомление, когда канал будет одобрен.",
+                    parse_mode="HTML"
                 )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить пользователя {added_by}: {e}")
+            
+            # Сохраняем в кэш ожидающих одобрения
+            self.pending_approvals[channel_db_id] = {
+                'channel_id': channel_id,
+                'added_by': added_by,
+                'channel_title': channel_info['title'],
+                'request_time': datetime.now()
+            }
             
             return {
                 'success': True,
                 'channel_id': channel_db_id,
-                'requires_approval': added_by != config.MAIN_ADMIN_ID,
-                'bot_is_admin': bot_is_admin
+                'requires_approval': True,
+                'message': 'Запрос на одобрение отправлен главному админу'
             }
             
         except Exception as e:
-            logger.error(f"Ошибка добавления канала: {e}")
+            logger.error(f"Ошибка запроса одобрения: {e}")
             return {'success': False, 'error': str(e)}
     
     async def approve_channel(self, channel_db_id: int, approved_by: int) -> Dict:
@@ -1472,6 +1551,10 @@ class ChannelManager:
                 WHERE id = ?
             ''', (approved_by, datetime.now().isoformat(), channel_db_id))
             
+            # Удаляем из кэша ожидающих одобрения
+            if channel_db_id in self.pending_approvals:
+                del self.pending_approvals[channel_db_id]
+            
             # Уведомляем того, кто добавил канал
             if added_by != approved_by:
                 try:
@@ -1481,11 +1564,24 @@ class ChannelManager:
                         f"📢 Канал: {channel_title}\n"
                         f"🔗 ID: {channel_id}\n"
                         f"👑 Одобрил: Главный админ\n\n"
-                        f"Теперь бот будет отправлять уведомления в этот канал.",
+                        f"Теперь бот будет отправлять уведомления в этот канал.\n"
+                        f"Используйте команду /notifications для управления уведомлениями.",
                         parse_mode="HTML"
                     )
                 except Exception as e:
                     logger.warning(f"Не удалось уведомить пользователя {added_by}: {e}")
+            
+            # Уведомляем главного админа
+            await bot.send_message(
+                approved_by,
+                f"✅ <b>КАНАЛ ОДОБРЕН</b>\n\n"
+                f"📢 Канал: {channel_title}\n"
+                f"🔗 ID: {channel_id}\n"
+                f"👤 Добавил: {added_by}\n\n"
+                f"Уведомления теперь будут отправляться в канал.\n"
+                f"Админ-уведомления отключены.",
+                parse_mode="HTML"
+            )
             
             # Логируем действие
             db.execute('''
@@ -1498,7 +1594,8 @@ class ChannelManager:
                 'success': True,
                 'channel_id': channel_db_id,
                 'channel_title': channel_title,
-                'admin_notifications': False
+                'admin_notifications': False,
+                'message': f'Канал "{channel_title}" одобрен'
             }
             
         except Exception as e:
@@ -1521,6 +1618,10 @@ class ChannelManager:
             # Удаляем канал из базы
             db.execute("DELETE FROM channels WHERE id = ?", (channel_db_id,))
             
+            # Удаляем из кэша
+            if channel_db_id in self.pending_approvals:
+                del self.pending_approvals[channel_db_id]
+            
             # Уведомляем того, кто добавил канал
             if added_by != rejected_by:
                 try:
@@ -1536,6 +1637,18 @@ class ChannelManager:
                     )
                 except Exception as e:
                     logger.warning(f"Не удалось уведомить пользователя {added_by}: {e}")
+            
+            # Уведомляем главного админа
+            await bot.send_message(
+                rejected_by,
+                f"❌ <b>КАНАЛ ОТКЛОНЕН</b>\n\n"
+                f"📢 Канал: {channel_title}\n"
+                f"🔗 ID: {channel_id}\n"
+                f"👤 Добавил: {added_by}\n"
+                f"📝 Причина: {reason or 'Не указана'}\n\n"
+                f"Канал удален из системы.",
+                parse_mode="HTML"
+            )
             
             # Логируем действие
             db.execute('''
@@ -1553,55 +1666,60 @@ class ChannelManager:
     async def toggle_channel_notifications(self, channel_db_id: int, enabled: bool = None) -> Dict:
         """Включает/выключает уведомления в канале"""
         try:
-            # Если enabled не указан, переключаем на противоположное
+            # Получаем текущее состояние
+            current = db.fetch_one(
+                "SELECT notifications_enabled, channel_title FROM channels WHERE id = ?",
+                (channel_db_id,)
+            )
+            
+            if not current:
+                return {'success': False, 'error': 'Канал не найден'}
+            
+            current_enabled, channel_title = current
+            
+            # Если enabled не указан, переключаем
             if enabled is None:
-                current = db.fetch_one(
-                    "SELECT notifications_enabled FROM channels WHERE id = ?",
-                    (channel_db_id,)
-                )
-                if current:
-                    enabled = not bool(current[0])
+                enabled = not bool(current_enabled)
             
             db.execute(
                 "UPDATE channels SET notifications_enabled = ? WHERE id = ?",
                 (1 if enabled else 0, channel_db_id)
             )
             
-            channel_data = db.fetch_one(
-                "SELECT channel_title FROM channels WHERE id = ?",
-                (channel_db_id,)
-            )
+            status = "включены" if enabled else "выключены"
             
             return {
                 'success': True,
                 'channel_id': channel_db_id,
                 'notifications_enabled': enabled,
-                'channel_title': channel_data[0] if channel_data else 'Unknown'
+                'channel_title': channel_title,
+                'message': f'Уведомления в канале "{channel_title}" {status}'
             }
             
         except Exception as e:
             logger.error(f"Ошибка переключения уведомлений: {e}")
             return {'success': False, 'error': str(e)}
-    
+        
+
     async def toggle_admin_notifications(self, channel_db_id: int, enabled: bool = None) -> Dict:
         """Включает/выключает уведомления админу"""
         try:
+            current = db.fetch_one(
+                "SELECT admin_notifications, channel_title FROM channels WHERE id = ?",
+                (channel_db_id,)
+            )
+            
+            if not current:
+                return {'success': False, 'error': 'Канал не найден'}
+            
+            current_enabled, channel_title = current
+            
             if enabled is None:
-                current = db.fetch_one(
-                    "SELECT admin_notifications FROM channels WHERE id = ?",
-                    (channel_db_id,)
-                )
-                if current:
-                    enabled = not bool(current[0])
+                enabled = not bool(current_enabled)
             
             db.execute(
                 "UPDATE channels SET admin_notifications = ? WHERE id = ?",
                 (1 if enabled else 0, channel_db_id)
-            )
-            
-            channel_data = db.fetch_one(
-                "SELECT channel_title FROM channels WHERE id = ?",
-                (channel_db_id,)
             )
             
             status = "включены" if enabled else "выключены"
@@ -1610,7 +1728,8 @@ class ChannelManager:
                 'success': True,
                 'channel_id': channel_db_id,
                 'admin_notifications': enabled,
-                'status_text': f"Уведомления админу {status}"
+                'channel_title': channel_title,
+                'message': f'Уведомления админу для канала "{channel_title}" {status}'
             }
             
         except Exception as e:
@@ -1623,14 +1742,23 @@ class ChannelManager:
         try:
             # Получаем информацию о канале
             channel_data = db.fetch_one(
-                "SELECT channel_id, notifications_enabled, admin_notifications FROM channels WHERE id = ?",
+                """SELECT channel_id, channel_title, notifications_enabled, 
+                   admin_notifications, is_approved FROM channels WHERE id = ?""",
                 (channel_db_id,)
             )
             
             if not channel_data:
                 return {'success': False, 'error': 'Канал не найден'}
             
-            channel_id, notifications_enabled, admin_notifications = channel_data
+            channel_id, channel_title, notifications_enabled, admin_notifications, is_approved = channel_data
+            
+            # Проверяем, одобрен ли канал
+            if not is_approved:
+                return {
+                    'success': False, 
+                    'error': 'Канал не одобрен для отправки уведомлений',
+                    'status': 'not_approved'
+                }
             
             # Если уведомления в канал выключены, отправляем админу
             if not notifications_enabled:
@@ -1638,12 +1766,23 @@ class ChannelManager:
                     await bot.send_message(
                         config.MAIN_ADMIN_ID,
                         f"🔕 <b>Сообщение для канала (уведомления выключены)</b>\n\n"
+                        f"📢 Канал: {channel_title}\n"
+                        f"🔗 ID: {channel_id}\n\n"
                         f"{message}",
                         parse_mode="HTML"
                     )
-                    return {'success': True, 'sent_to_admin': True, 'sent_to_channel': False}
+                    return {
+                        'success': True, 
+                        'sent_to_admin': True, 
+                        'sent_to_channel': False,
+                        'message': 'Отправлено только админу (уведомления выключены)'
+                    }
                 else:
-                    return {'success': False, 'error': 'Уведомления отключены'}
+                    return {
+                        'success': False, 
+                        'error': 'Уведомления отключены',
+                        'status': 'notifications_disabled'
+                    }
             
             # Отправляем в канал
             try:
@@ -1653,19 +1792,22 @@ class ChannelManager:
                             sent_message = await bot.send_photo(
                                 channel_id,
                                 InputFile(f),
-                                caption=message
+                                caption=message,
+                                parse_mode="HTML"
                             )
                         elif media_path.lower().endswith('.mp4'):
                             sent_message = await bot.send_video(
                                 channel_id,
                                 InputFile(f),
-                                caption=message
+                                caption=message,
+                                parse_mode="HTML"
                             )
                         else:
                             sent_message = await bot.send_document(
                                 channel_id,
                                 InputFile(f),
-                                caption=message
+                                caption=message,
+                                parse_mode="HTML"
                             )
                 else:
                     sent_message = await bot.send_message(
@@ -1680,29 +1822,52 @@ class ChannelManager:
                     (sent_message.message_id, datetime.now().isoformat(), channel_db_id)
                 )
                 
+                # Логируем отправку
+                db.execute('''
+                    INSERT INTO messages 
+                    (message_id, chat_id, message_type, message_text, sent_date, status)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    sent_message.message_id,
+                    channel_id,
+                    message_type,
+                    message[:500],
+                    datetime.now().isoformat(),
+                    'sent_to_channel'
+                ))
+                
                 return {
                     'success': True,
                     'message_id': sent_message.message_id,
                     'sent_to_channel': True,
-                    'sent_to_admin': False
+                    'sent_to_admin': False,
+                    'channel_title': channel_title,
+                    'message': f'Сообщение отправлено в канал "{channel_title}"'
                 }
                 
-            except Exception as e:
-                logger.error(f"Ошибка отправки в канал {channel_id}: {e}")
+            except TelegramBadRequest as e:
+                error_msg = str(e)
+                logger.error(f"Ошибка отправки в канал {channel_id}: {error_msg}")
                 
                 # Если не удалось отправить в канал, отправляем админу
                 if admin_notifications:
                     await bot.send_message(
                         config.MAIN_ADMIN_ID,
-                        f"⚠️ <b>Ошибка отправки в канал</b>\n\n"
-                        f"Канал: {channel_id}\n"
-                        f"Ошибка: {str(e)[:200]}\n\n"
+                        f"⚠️ <b>ОШИБКА ОТПРАВКИ В КАНАЛ</b>\n\n"
+                        f"📢 Канал: {channel_title}\n"
+                        f"🔗 ID: {channel_id}\n"
+                        f"❌ Ошибка: {error_msg[:200]}\n\n"
                         f"Сообщение: {message[:500]}",
                         parse_mode="HTML"
                     )
-                    return {'success': False, 'error': str(e), 'sent_to_admin': True}
+                    return {
+                        'success': False, 
+                        'error': error_msg, 
+                        'sent_to_admin': True,
+                        'status': 'error_sent_to_admin'
+                    }
                 else:
-                    return {'success': False, 'error': str(e)}
+                    return {'success': False, 'error': error_msg}
                 
         except Exception as e:
             logger.error(f"Ошибка отправки в канал: {e}")
@@ -1711,15 +1876,21 @@ class ChannelManager:
     async def get_all_channels(self, filters: Dict = None) -> List[Dict]:
         """Получает список всех каналов"""
         try:
-            query = "SELECT id, channel_id, channel_title, channel_username, is_approved, notifications_enabled, admin_notifications, added_date FROM channels"
+            query = """SELECT id, channel_id, channel_title, channel_username, 
+                      is_approved, notifications_enabled, admin_notifications, 
+                      added_date, bot_is_admin FROM channels"""
             params = []
             
             if filters:
                 conditions = []
                 if filters.get('approved_only'):
                     conditions.append("is_approved = 1")
+                if filters.get('pending_only'):
+                    conditions.append("is_approved = 0")
                 if filters.get('active_only'):
                     conditions.append("notifications_enabled = 1")
+                if filters.get('bot_admin_only'):
+                    conditions.append("bot_is_admin = 1")
                 if filters.get('search'):
                     conditions.append("(channel_title LIKE ? OR channel_username LIKE ?)")
                     search_term = f"%{filters['search']}%"
@@ -1728,7 +1899,7 @@ class ChannelManager:
                 if conditions:
                     query += " WHERE " + " AND ".join(conditions)
             
-            query += " ORDER BY added_date DESC"
+            query += " ORDER BY is_approved DESC, added_date DESC"
             
             channels = db.fetch_all(query, params)
             
@@ -1742,7 +1913,8 @@ class ChannelManager:
                     'is_approved': bool(ch[4]),
                     'notifications_enabled': bool(ch[5]),
                     'admin_notifications': bool(ch[6]),
-                    'added_date': ch[7]
+                    'added_date': ch[7],
+                    'bot_is_admin': bool(ch[8])
                 })
             
             return result
@@ -1750,6 +1922,28 @@ class ChannelManager:
         except Exception as e:
             logger.error(f"Ошибка получения списка каналов: {e}")
             return []
+    
+    async def get_channel_stats(self) -> Dict:
+        """Получает статистику по каналам"""
+        try:
+            total = db.fetch_one("SELECT COUNT(*) FROM channels")[0] or 0
+            approved = db.fetch_one("SELECT COUNT(*) FROM channels WHERE is_approved = 1")[0] or 0
+            pending = db.fetch_one("SELECT COUNT(*) FROM channels WHERE is_approved = 0")[0] or 0
+            active = db.fetch_one("SELECT COUNT(*) FROM channels WHERE notifications_enabled = 1")[0] or 0
+            bot_admin = db.fetch_one("SELECT COUNT(*) FROM channels WHERE bot_is_admin = 1")[0] or 0
+            
+            return {
+                'total': total,
+                'approved': approved,
+                'pending': pending,
+                'active': active,
+                'bot_admin': bot_admin,
+                'pending_approvals': len(self.pending_approvals)
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики каналов: {e}")
+            return {}
 
 channel_manager = ChannelManager()
 
@@ -1883,6 +2077,257 @@ class AdminManager:
             logger.error(f"Ошибка добавления администратора: {e}")
             return {'success': False, 'error': str(e)}
     
+
+# ========== ОБРАБОТЧИК MY_CHAT_MEMBER ==========
+@dp.my_chat_member()
+async def handle_my_chat_member(update: types.ChatMemberUpdated):
+    """Обрабатывает изменение статуса бота в чате/канале"""
+    try:
+        chat_member = update.new_chat_member
+        chat = update.chat
+        user = update.from_user
+        
+        # Проверяем, что бота добавили как администратора
+        if chat_member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+            logger.info(f"Бота добавили как администратора в {chat.type} {chat.id}")
+            
+            # Определяем тип чата
+            chat_type = str(chat.type).lower()
+            
+            # Обрабатываем только каналы и группы
+            if chat_type in ['channel', 'group', 'supergroup']:
+                # Запрашиваем одобрение у главного админа
+                result = await channel_manager.handle_bot_added_as_admin(
+                    chat.id,
+                    user.id,
+                    chat.id
+                )
+                
+                # Уведомляем пользователя
+                if result.get('success'):
+                    if result.get('requires_approval'):
+                        try:
+                            await bot.send_message(
+                                user.id,
+                                f"✅ <b>БОТ УСПЕШНО ДОБАВЛЕН!</b>\n\n"
+                                f"📢 {chat.type}: {chat.title}\n"
+                                f"🔗 ID: {chat.id}\n\n"
+                                f"<b>Статус:</b> Ожидает одобрения главного администратора.\n"
+                                f"Вы получите уведомление, когда канал будет одобрен.",
+                                parse_mode="HTML"
+                            )
+                        except:
+                            pass
+                    else:
+                        try:
+                            await bot.send_message(
+                                user.id,
+                                f"✅ <b>БОТ УСПЕШНО ДОБАВЛЕН И ОДОБРЕН!</b>\n\n"
+                                f"📢 {chat.type}: {chat.title}\n"
+                                f"🔗 ID: {chat.id}\n\n"
+                                f"Теперь бот может отправлять уведомления в этот {chat.type}.",
+                                parse_mode="HTML"
+                            )
+                        except:
+                            pass
+        
+        # Если бота удалили из администраторов
+        elif chat_member.status == ChatMemberStatus.LEFT or chat_member.status == ChatMemberStatus.KICKED:
+            logger.info(f"Бота удалили из администраторов {chat.id}")
+            
+            # Обновляем статус в базе
+            db.execute(
+                "UPDATE channels SET bot_is_admin = 0 WHERE channel_id = ?",
+                (chat.id,)
+            )
+            
+            # Уведомляем главного админа
+            try:
+                await bot.send_message(
+                    config.MAIN_ADMIN_ID,
+                    f"⚠️ <b>БОТА УДАЛИЛИ ИЗ АДМИНИСТРАТОРОВ</b>\n\n"
+                    f"📢 {chat.type}: {chat.title}\n"
+                    f"🔗 ID: {chat.id}\n"
+                    f"👤 Удалил: {user.id}\n\n"
+                    f"Бот больше не может отправлять уведомления в этот {chat.type}.",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+            
+    except Exception as e:
+        logger.error(f"Ошибка обработки my_chat_member: {e}")
+
+# ========== КОМАНДА ДЛЯ УПРАВЛЕНИЯ УВЕДОМЛЕНИЯМИ ==========
+@dp.message(Command("notifications"))
+async def cmd_notifications(message: Message, state: FSMContext):
+    """Команда для управления уведомлениями в каналах"""
+    user_id = message.from_user.id
+    
+    # Проверяем, является ли админом
+    if not admin_manager.is_admin(user_id):
+        await message.answer("❌ У вас нет доступа к управлению уведомлениями.")
+        return
+    
+    # Получаем список каналов пользователя
+    channels = db.fetch_all(
+        "SELECT id, channel_title, channel_username, is_approved, notifications_enabled FROM channels WHERE added_by = ? ORDER BY channel_title",
+        (user_id,)
+    )
+    
+    if not channels:
+        await message.answer(
+            "📭 <b>У ВАС НЕТ ДОБАВЛЕННЫХ КАНАЛОВ</b>\n\n"
+            "Чтобы добавить канал:\n"
+            "1. Добавьте бота как администратора в канал/группу\n"
+            "2. Дождитесь одобрения главного администратора\n\n"
+            "<i>После одобрения вы сможете управлять уведомлениями здесь.</i>",
+            parse_mode="HTML"
+        )
+        return
+    
+    keyboard_buttons = []
+    
+    for channel in channels:
+        channel_id, title, username, is_approved, notifications_enabled = channel
+        status_icon = "✅" if notifications_enabled else "🔕"
+        approval_icon = "✅" if is_approved else "⏳"
+        
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                text=f"{status_icon} {title[:20]}{'...' if len(title) > 20 else ''}",
+                callback_data=f"manage_channel:{channel_id}"
+            )
+        ])
+    
+    # Добавляем кнопку "Назад" для админов
+    if admin_manager.is_admin(user_id):
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="↩️ В админ-панель", callback_data="back_to_main")
+        ])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await message.answer(
+        "🔔 <b>УПРАВЛЕНИЕ УВЕДОМЛЕНИЯМИ</b>\n\n"
+        f"📊 Ваши каналы ({len(channels)}):\n\n"
+        "<i>Выберите канал для управления уведомлениями:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("manage_channel:"))
+async def manage_channel_notifications(callback_query: CallbackQuery):
+    """Управление уведомлениями для конкретного канала"""
+    channel_db_id = int(callback_query.data.split(":")[1])
+    user_id = callback_query.from_user.id
+    
+    # Получаем информацию о канале
+    channel_data = db.fetch_one(
+        """SELECT channel_title, channel_username, is_approved, 
+           notifications_enabled, admin_notifications, channel_id 
+           FROM channels WHERE id = ? AND (added_by = ? OR ? = ?)""",
+        (channel_db_id, user_id, user_id, config.MAIN_ADMIN_ID)
+    )
+    
+    if not channel_data:
+        await callback_query.answer("❌ Канал не найден или нет доступа")
+        return
+    
+    title, username, is_approved, notif_enabled, admin_notif, channel_id = channel_data
+    
+    # Создаем клавиатуру управления
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"{'🔕 Отключить' if notif_enabled else '🔔 Включить'} уведомления",
+                callback_data=f"toggle_notif:{channel_db_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'👁️ Скрыть' if admin_notif else '👁️ Показывать'} админу",
+                callback_data=f"toggle_admin_notif:{channel_db_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📊 Статистика",
+                callback_data=f"channel_stats:{channel_db_id}"
+            ),
+            InlineKeyboardButton(
+                text="🔧 Проверить права",
+                callback_data=f"check_channel_perms:{channel_db_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🗑️ Удалить канал",
+                callback_data=f"delete_channel:{channel_db_id}"
+            ) if user_id == config.MAIN_ADMIN_ID else InlineKeyboardButton(
+                text="📝 Запросить удаление",
+                callback_data=f"request_delete:{channel_db_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="↩️ Назад", callback_data="notifications_back")
+        ]
+    ])
+    
+    status_text = "✅ Одобрен" if is_approved else "⏳ Ожидает одобрения"
+    notif_text = "🔔 Включены" if notif_enabled else "🔕 Выключены"
+    admin_notif_text = "👁️ Показываются админу" if admin_notif else "👁️ Скрыты от админа"
+    
+    await callback_query.message.edit_text(
+        f"🔧 <b>УПРАВЛЕНИЕ КАНАЛОМ</b>\n\n"
+        f"📢 Название: {title}\n"
+        f"🔗 Username: @{username if username else 'нет'}\n"
+        f"🆔 ID: {channel_id}\n\n"
+        f"📊 Статус:\n"
+        f"• {status_text}\n"
+        f"• {notif_text}\n"
+        f"• {admin_notif_text}\n\n"
+        f"<i>Выберите действие:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("toggle_notif:"))
+async def toggle_channel_notifications(callback_query: CallbackQuery):
+    """Переключает уведомления в канале"""
+    channel_db_id = int(callback_query.data.split(":")[1])
+    
+    result = await channel_manager.toggle_channel_notifications(channel_db_id)
+    
+    if result['success']:
+        await callback_query.answer(result['message'])
+        # Обновляем сообщение
+        await manage_channel_notifications(callback_query)
+    else:
+        await callback_query.answer(f"❌ Ошибка: {result.get('error', 'Неизвестная ошибка')}")
+
+@dp.callback_query(F.data.startswith("toggle_admin_notif:"))
+async def toggle_admin_notifications(callback_query: CallbackQuery):
+    """Переключает уведомления админу"""
+    channel_db_id = int(callback_query.data.split(":")[1])
+    
+    result = await channel_manager.toggle_admin_notifications(channel_db_id)
+    
+    if result['success']:
+        await callback_query.answer(result['message'])
+        # Обновляем сообщение
+        await manage_channel_notifications(callback_query)
+    else:
+        await callback_query.answer(f"❌ Ошибка: {result.get('error', 'Неизвестная ошибка')}")
+
+@dp.callback_query(F.data == "notifications_back")
+async def notifications_back(callback_query: CallbackQuery):
+    """Возврат к списку каналов"""
+    await cmd_notifications(callback_query.message, None)
+
+
+
+
     async def remove_admin(self, admin_id: int, removed_by: int, reason: str = "") -> Dict:
         """Удаляет администратора"""
         try:
@@ -2038,6 +2483,54 @@ class AdminManager:
             logger.error(f"Ошибка получения списка администраторов: {e}")
             return []
     
+# В главном меню админа добавляем:
+keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="📨 Отправить сообщение", callback_data="admin_send_message")],
+    [InlineKeyboardButton(text="📢 Управление каналами", callback_data="admin_channels")],
+    [InlineKeyboardButton(text="🔔 Управление уведомлениями", callback_data="admin_notifications")],  # Новая кнопка
+    [InlineKeyboardButton(text="👥 Управление админами", callback_data="admin_manage")],
+    [InlineKeyboardButton(text="👤 Управление аккаунтами", callback_data="admin_accounts")],
+    [InlineKeyboardButton(text="⚙️ Настройки", callback_data="admin_settings")]
+])
+
+@dp.callback_query(F.data == "admin_notifications")
+async def admin_notifications_menu(callback_query: CallbackQuery):
+    """Меню управления уведомлениями для админов"""
+    if not admin_manager.is_admin(callback_query.from_user.id):
+        await callback_query.answer("❌ Доступ запрещен")
+        return
+    
+    # Получаем статистику
+    stats = await channel_manager.get_channel_stats()
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Мои каналы", callback_data="my_channels"),
+            InlineKeyboardButton(text="📢 Все каналы", callback_data="all_channels")
+        ],
+        [
+            InlineKeyboardButton(text="⏳ Ожидают одобрения", callback_data="pending_channels"),
+            InlineKeyboardButton(text="🧪 Тест уведомлений", callback_data="test_notifications")
+        ],
+        [
+            InlineKeyboardButton(text="📊 Статистика", callback_data="channels_stats"),
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="notification_settings")
+        ],
+        [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")]
+    ])
+    
+    await callback_query.message.edit_text(
+        f"🔔 <b>УПРАВЛЕНИЕ УВЕДОМЛЕНИЯМИ</b>\n\n"
+        f"📊 Статистика:\n"
+        f"• Всего каналов: {stats.get('total', 0)}\n"
+        f"• Одобрено: {stats.get('approved', 0)}\n"
+        f"• Ожидают: {stats.get('pending', 0)}\n"
+        f"• Активны: {stats.get('active', 0)}\n\n"
+        f"<i>Выберите действие:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
     async def validate_session(self, user_id: int, session_token: str) -> bool:
         """Проверяет валидность сессии администратора"""
         try:
@@ -3780,6 +4273,7 @@ async def admin_settings_menu(callback_query: CallbackQuery):
     )
 
 # ========== ОБРАБОТЧИКИ ОДОБРЕНИЯ КАНАЛОВ ==========
+# ========== УЛУЧШЕННЫЕ ОБРАБОТЧИКИ ОДОБРЕНИЯ КАНАЛОВ ==========
 @dp.callback_query(F.data.startswith("approve_channel:"))
 async def handle_approve_channel(callback_query: CallbackQuery):
     if not admin_manager.is_main_admin(callback_query.from_user.id):
@@ -3788,6 +4282,8 @@ async def handle_approve_channel(callback_query: CallbackQuery):
     
     channel_db_id = int(callback_query.data.split(":")[1])
     
+    # Убираем кнопки из сообщения
+    await callback_query.message.edit_reply_markup(reply_markup=None)
     await callback_query.message.edit_text(
         f"⏳ <b>Одобряю канал #{channel_db_id}...</b>",
         parse_mode="HTML"
@@ -3800,10 +4296,31 @@ async def handle_approve_channel(callback_query: CallbackQuery):
             f"✅ <b>КАНАЛ ОДОБРЕН!</b>\n\n"
             f"📢 Канал: {result.get('channel_title', 'Unknown')}\n"
             f"🎯 ID в системе: {channel_db_id}\n\n"
-            f"Уведомления будут отправляться в канал.\n"
-            f"Админ-уведомления отключены.",
+            f"{result.get('message', 'Уведомления будут отправляться в канал.')}",
             parse_mode="HTML"
         )
+        
+        # Тестовое сообщение в канал
+        try:
+            test_result = await channel_manager.send_to_channel(
+                channel_db_id,
+                "✅ <b>БОТ АКТИВИРОВАН!</b>\n\n"
+                "Этот канал был одобрен для получения уведомлений.\n"
+                "Теперь бот будет отправлять сюда важные уведомления.",
+                message_type='system'
+            )
+            
+            if not test_result['success']:
+                await callback_query.message.reply(
+                    f"⚠️ <b>ТЕСТОВОЕ СООБЩЕНИЕ НЕ ОТПРАВЛЕНО</b>\n\n"
+                    f"Ошибка: {test_result.get('error', 'Неизвестная ошибка')}\n\n"
+                    f"<i>Проверьте права бота в канале.</i>",
+                    parse_mode="HTML"
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка отправки тестового сообщения: {e}")
+            
     else:
         await callback_query.message.edit_text(
             f"❌ <b>ОШИБКА ОДОБРЕНИЯ КАНАЛА</b>\n\n"
@@ -3811,6 +4328,101 @@ async def handle_approve_channel(callback_query: CallbackQuery):
             f"Ошибка: {result.get('error', 'Неизвестная ошибка')}",
             parse_mode="HTML"
         )
+
+# ========== ТЕСТОВАЯ КОМАНДА ДЛЯ ОТПРАВКИ УВЕДОМЛЕНИЙ ==========
+@dp.message(Command("test_notify"))
+async def cmd_test_notify(message: Message, state: FSMContext):
+    """Тестовая отправка уведомления во все одобренные каналы"""
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ У вас нет доступа к этой команде.")
+        return
+    
+    await state.set_state(AdminStates.waiting_broadcast_text)
+    await state.update_data(is_test=True)
+    
+    await message.answer(
+        "🧪 <b>ТЕСТОВАЯ ОТПРАВКА УВЕДОМЛЕНИЯ</b>\n\n"
+        "Введите текст тестового уведомления:\n\n"
+        "<i>Оно будет отправлено во все одобренные каналы</i>",
+        parse_mode="HTML"
+    )
+
+@dp.message(AdminStates.waiting_broadcast_text)
+async def process_test_notify_text(message: Message, state: FSMContext):
+    if not admin_manager.is_admin(message.from_user.id):
+        await message.answer("❌ Доступ запрещен")
+        await state.clear()
+        return
+    
+    text = message.text
+    user_data = await state.get_data()
+    is_test = user_data.get('is_test', False)
+    
+    if not text:
+        await message.answer("❌ Текст не может быть пустым")
+        return
+    
+    # Получаем все одобренные каналы
+    channels = await channel_manager.get_all_channels({'approved_only': True})
+    
+    if not channels:
+        await message.answer(
+            "❌ <b>НЕТ ОДОБРЕННЫХ КАНАЛОВ</b>\n\n"
+            "Нет каналов для отправки уведомлений.",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+    
+    # Подготавливаем сообщение
+    test_prefix = "🧪 ТЕСТОВОЕ УВЕДОМЛЕНИЕ\n\n" if is_test else ""
+    full_message = f"{test_prefix}{text}\n\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    
+    # Отправляем в каждый канал
+    success_count = 0
+    fail_count = 0
+    results = []
+    
+    await message.answer(f"⏳ <b>Отправляю в {len(channels)} канал(ов)...</b>", parse_mode="HTML")
+    
+    for channel in channels:
+        if not channel['notifications_enabled']:
+            results.append(f"❌ {channel['title']}: уведомления выключены")
+            fail_count += 1
+            continue
+        
+        result = await channel_manager.send_to_channel(
+            channel['id'],
+            full_message,
+            message_type='test'
+        )
+        
+        if result['success']:
+            results.append(f"✅ {channel['title']}: отправлено")
+            success_count += 1
+        else:
+            results.append(f"❌ {channel['title']}: {result.get('error', 'Ошибка')}")
+            fail_count += 1
+        
+        # Задержка между отправками
+        await asyncio.sleep(0.5)
+    
+    # Формируем отчет
+    report = f"📊 <b>ОТЧЕТ О ТЕСТОВОЙ ОТПРАВКЕ</b>\n\n"
+    report += f"✅ Успешно: {success_count}\n"
+    report += f"❌ Ошибок: {fail_count}\n"
+    report += f"📝 Текст: {text[:100]}...\n\n"
+    
+    if results:
+        report += "<b>Результаты по каналам:</b>\n"
+        for i, res in enumerate(results[:10]):  # Показываем первые 10
+            report += f"{i+1}. {res}\n"
+        
+        if len(results) > 10:
+            report += f"\n... и еще {len(results) - 10} каналов\n"
+    
+    await message.answer(report, parse_mode="HTML")
+    await state.clear()
 
 @dp.callback_query(F.data.startswith("reject_channel:"))
 async def handle_reject_channel(callback_query: CallbackQuery, state: FSMContext):
@@ -3823,10 +4435,14 @@ async def handle_reject_channel(callback_query: CallbackQuery, state: FSMContext
     await state.set_state(AdminStates.waiting_channel_action)
     await state.update_data(channel_db_id=channel_db_id, action='reject')
     
+    # Убираем кнопки из сообщения
+    await callback_query.message.edit_reply_markup(reply_markup=None)
+    
     await callback_query.message.edit_text(
         f"📝 <b>УКАЖИТЕ ПРИЧИНУ ОТКЛОНЕНИЯ</b>\n\n"
         f"Канал ID: {channel_db_id}\n\n"
-        f"Введите причину отклонения канала:",
+        f"Введите причину отклонения канала:\n\n"
+        f"<i>Или отправьте /cancel для отмены</i>",
         parse_mode="HTML"
     )
 
@@ -3862,6 +4478,76 @@ async def process_channel_action_reason(message: Message, state: FSMContext):
             )
     
     await state.clear()
+# Инициализация менеджера каналов
+channel_manager = ChannelManager()
+
+# Запускаем системы мониторинга
+async def start_background_tasks():
+    """Запускает фоновые задачи системы"""
+    logger.info("Запуск фоновых задач...")
+    
+    # Запускаем систему авто-входа
+    await auto_login_system.start_monitoring()
+    
+    # Запускаем проверку статуса бота в каналах
+    asyncio.create_task(check_channels_status_task())
+    
+    logger.info("Фоновые задачи запущены")
+
+async def check_channels_status_task():
+    """Периодически проверяет статус бота в каналах"""
+    while True:
+        try:
+            # Получаем все каналы где бот должен быть админом
+            channels = db.fetch_all(
+                "SELECT id, channel_id, channel_title FROM channels WHERE bot_is_admin = 1"
+            )
+            
+            for channel in channels:
+                channel_db_id, channel_id, title = channel
+                
+                try:
+                    # Проверяем статус бота
+                    member = await bot.get_chat_member(channel_id, (await bot.get_me()).id)
+                    
+                    # Если бот больше не админ
+                    if member.status not in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]:
+                        db.execute(
+                            "UPDATE channels SET bot_is_admin = 0 WHERE id = ?",
+                            (channel_db_id,)
+                        )
+                        
+                        logger.warning(f"Бот больше не админ в канале {title} ({channel_id})")
+                        
+                        # Уведомляем главного админа
+                        await bot.send_message(
+                            config.MAIN_ADMIN_ID,
+                            f"⚠️ <b>БОТ УДАЛЕН ИЗ АДМИНИСТРАТОРОВ</b>\n\n"
+                            f"📢 Канал: {title}\n"
+                            f"🔗 ID: {channel_id}\n\n"
+                            f"Бот больше не может отправлять уведомления в этот канал.",
+                            parse_mode="HTML"
+                        )
+                        
+                except TelegramBadRequest as e:
+                    if "chat not found" in str(e).lower() or "user not found" in str(e).lower():
+                        # Канал не найден или бот удален
+                        db.execute(
+                            "UPDATE channels SET bot_is_admin = 0, notifications_enabled = 0 WHERE id = ?",
+                            (channel_db_id,)
+                        )
+                        logger.warning(f"Канал {title} не найден или бот удален")
+                
+                except Exception as e:
+                    logger.error(f"Ошибка проверки статуса в канале {channel_id}: {e}")
+                
+                await asyncio.sleep(1)  # Задержка между проверками
+            
+            await asyncio.sleep(3600)  # Проверка каждый час
+            
+        except Exception as e:
+            logger.error(f"Ошибка в задаче проверки статуса каналов: {e}")
+            await asyncio.sleep(300)
 
 # ========== ОБРАБОТЧИК КНОПКИ НАЗАД ==========
 @dp.callback_query(F.data == "back_to_main")
