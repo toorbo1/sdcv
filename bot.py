@@ -89,12 +89,12 @@ class VerificationStates(StatesGroup):
     waiting_code = State()  # Добавьте эту строку
     waiting_phone = State()
 
-# Добавьте этот декоратор для отладки всех входящих сообщений
-@dp.message()
-async def debug_all_messages(message: types.Message):
-    """Функция для отладки - логирует все входящие сообщения"""
-    logger.debug(f"DEBUG: Получено сообщение от {message.from_user.id}: {message.text or message.content_type}")
-    
+# # Добавьте этот декоратор для отладки всех входящих сообщений
+# @dp.message()
+# async def debug_all_messages(message: types.Message):
+#     """Функция для отладки - логирует все входящие сообщения"""
+#     logger.debug(f"DEBUG: Получено сообщение от {message.from_user.id}: {message.text or message.content_type}")
+
 # Инициализация БД с учетом окружения
 def init_db():
     # Определяем путь к БД в зависимости от окружения
