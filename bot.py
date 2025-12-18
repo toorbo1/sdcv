@@ -1111,7 +1111,7 @@ async def process_item_type(callback_query: types.CallbackQuery, state: FSMConte
 ✅ Нет водяных знаков
 ✅ Максимум 5 фото
 
-<b>Отправьте фото или нажмите /skip если фото нет</b>
+<b>Отправьте фото и после нажмите /skip для заполнения описания продукта</b>
     """
     
     await state.set_state(SellerStates.waiting_photos)
