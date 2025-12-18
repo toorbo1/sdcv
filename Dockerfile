@@ -2,19 +2,23 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Устанавливаем системные зависимости для Chrome и других библиотек
+# 1. Устанавливаем системные зависимости, включая apt-transport-https
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     unzip \
     curl \
+    apt-transport-https \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Устанавливаем Chrome для selenium
-RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
+# 2. УСТРАНЕНИЕ ОШИБКИ: новый метод добавления ключа Google Chrome (без apt-key)
+RUN wget -q -O /usr/share/keyrings/google-chrome-keyring.gpg https://dl.google.com/linux/linux_signing_key.pub \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+
+# 3. Устанавливаем Google Chrome
+RUN apt-get update \
+    && apt-get install -y google-chrome-stable --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Копируем и устанавливаем Python зависимости
