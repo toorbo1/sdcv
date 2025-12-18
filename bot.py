@@ -95,7 +95,7 @@ print(f"Bot token: {API_TOKEN[:10]}...")
 print(f"Admin ID: {ADMIN_ID}")
 print(f"Moderator IDs: {MODERATOR_IDS}")
 print(f"Telegram API ID: {TELEGRAM_API_ID}")
-print(f"Telegram API Hash: {TELEGRAM_API_HASH[:10]}...")
+print(f"Хэш Telegram API: {TELEGRAM_API_HASH[:10] if TELEGRAM_API_HASH else 'Не установлен'}...")
 
 # Инициализация
 storage = MemoryStorage()
