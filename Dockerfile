@@ -2,7 +2,6 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 1. Устанавливаем системные зависимости, включая apt-transport-https
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
@@ -12,23 +11,22 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. УСТРАНЕНИЕ ОШИБКИ: новый метод добавления ключа Google Chrome (без apt-key)
 RUN wget -q -O /usr/share/keyrings/google-chrome-keyring.gpg https://dl.google.com/linux/linux_signing_key.pub \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
 
-# 3. Устанавливаем Google Chrome
 RUN apt-get update \
     && apt-get install -y google-chrome-stable --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем и устанавливаем Python зависимости
-COPY requirements.txt .
+# Исправленные зависимости
+COPY requirements_fixed.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код приложения
 COPY . .
 
-# Создаем необходимые директории
 RUN mkdir -p sessions media logs
+
+# Патч для исправления импорта
+RUN sed -i 's/from aiogram.client.default import DefaultBotProperties/# from aiogram.client.default import DefaultBotProperties/' /app/bot.py
 
 CMD ["python", "bot.py"]

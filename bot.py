@@ -27,7 +27,8 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.utils.deep_linking import create_start_link, decode_payload
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.utils.token import TokenValidationError
-from aiogram.client.default import DefaultBotProperties
+# УБИРАЕМ проблемный импорт
+# from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ChatType
 from aiogram.methods import GetChat, GetChatMember, LeaveChat
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError, TelegramUnauthorizedError
@@ -118,19 +119,18 @@ logging.getLogger('pyrogram').setLevel(logging.WARNING)
 logging.getLogger('aiohttp').setLevel(logging.WARNING)
 logging.getLogger('asyncio').setLevel(logging.WARNING)
 
-# ========== ИНИЦИАЛИЗАЦИЯ БОТА С ПРОКСИ ==========
 def create_bot_with_proxy():
     """Создает бота с настройками прокси для анонимности"""
     
     # Генерируем случайный user-agent
     user_agent = fake_useragent.UserAgent().random
     
-    # Настройки по умолчанию для бота
-    default = DefaultBotProperties(
-        parse_mode=ParseMode.HTML,
-        link_preview_is_disabled=True,
-        protect_content=False
-    )
+    # Параметры бота
+    bot_params = {
+        'parse_mode': ParseMode.HTML,
+        'disable_web_page_preview': True,
+        'protect_content': False
+    }
     
     # Если есть прокси, настраиваем
     session = None
@@ -185,8 +185,8 @@ def create_bot_with_proxy():
     # Создаем бота
     bot = Bot(
         token=config.API_TOKEN,
-        default=default,
-        session=session
+        session=session,
+        **bot_params
     )
     
     return bot
