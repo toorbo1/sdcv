@@ -5,7 +5,7 @@ builder = "nixpacks"
 startCommand = "python bot.py"
 
 [variables]
-API_TOKEN = "7803868173:AAF7MrQCePuVzxJyOdm9DzzFnL3817S2100"
+API_TOKEN = "8568019720:AAGZhJHAvxNl2_CVYFgzW6B7nTKXZBDuUs8"
 MAIN_ADMIN_ID = "8358009538"
 SECRET_KEY = "ваш_секретный_ключ_32_символа"
 ENCRYPTION_KEY = "ваш_ключ_шифрования_32_символа"
