@@ -911,66 +911,10 @@ async def handle_commands(message: Message):
 async def handle_waiting_phone(message: Message, state: FSMContext):
     # Только для этого состояния
     
-# 3. И только В САМОМ КОНЦЕ общий обработчик
- @dp.message(F.chat.type == ChatType.PRIVATE)
- async def handle_private_message(message: Message):
-    # Этот обработчик сработает ТОЛЬКО если предыдущие не сработали
-    await message_forwarder.forward_user_message(message.from_user.id, message)
-
-# ========== ОБРАБОТЧИК СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ==========
-@dp.message(F.chat.type == ChatType.PRIVATE)
-async def handle_private_message(message: Message):
-    """Обрабатывает все НЕ-командные сообщения от пользователей"""
-    
-    # Если это команда - игнорируем (она обработается отдельно)
-    if message.text and message.text.startswith('/'):
-        return  # Пропускаем команды
-    
-    # Если пользователь в состоянии FSM - тоже пропускаем
-    current_state = await dp.storage.get_state(user=message.from_user.id)
-    if current_state and current_state != "none":
-        return  # Состояния обрабатываются отдельными хендлерами
-    
-    # Только здесь логика пересылки
-    user_id = message.from_user.id
-    channel_id = message_forwarder.get_user_channel(user_id)
-    
-    if channel_id:
-        result = await message_forwarder.forward_user_message(user_id, message)
-        # ... остальной код
-        
-        if result['success']:
-            # Опционально: отправляем подтверждение пользователю
-            try:
-                await message.reply(
-                    f"✅ <b>Сообщение отправлено в канал</b>\n\n"
-                    f"📢 Канал: {result.get('channel_title', 'Неизвестно')}\n"
-                    f"📨 ID сообщения: {result.get('message_id', 'Неизвестно')}",
-                    parse_mode="HTML"
-                )
-            except:
-                pass  # Необязательное уведомление
-        else:
-            # Если ошибка - уведомляем пользователя
-            try:
-                await message.reply(
-                    f"❌ <b>ОШИБКА ОТПРАВКИ</b>\n\n"
-                    f"Не удалось отправить сообщение в канал.\n"
-                    f"Ошибка: {result.get('error', 'Неизвестная ошибка')}",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-        return  # Завершаем обработку, если сообщение переслано
-    
-    # Далее продолжаем обычную обработку команд бота
-    # Если это не команда - игнорируем
-    if message.text and message.text.startswith('/'):
-        return  # Команды обрабатываются отдельно
 
 # ========== КОМАНДЫ ДЛЯ НАСТРОЙКИ ПЕРЕСЫЛКИ ==========
-@dp.message(Command("setup_forward"))
-async def cmd_setup_forward(message: Message, state: FSMContext):
+ @dp.message(Command("setup_forward"))
+ async def cmd_setup_forward(message: Message, state: FSMContext):
     """Настройка пересылки сообщений в канал"""
     user_id = message.from_user.id
     
