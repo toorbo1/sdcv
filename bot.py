@@ -91,7 +91,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
-API_TOKEN = os.getenv('8568019720:AAGZhJHAvxNl2_CVYFgzW6B7nTKXZBDuUs8', 'YOUR_BOT_TOKEN_HERE')
+API_TOKEN = os.getenv('API_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '8358009538'))
 
 # Инициализация
