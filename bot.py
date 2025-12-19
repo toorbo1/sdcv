@@ -899,23 +899,45 @@ class MessageForwarder:
 
 # Создаем экземпляр менеджера пересылки
 message_forwarder = MessageForwarder()
+
+# 1. Сначала команды
+@dp.message(Command("start", "help", "status", "admin", "test"))
+async def handle_commands(message: Message):
+    """Обработчик только для команд"""
+    # Команды будут обработаны здесь, не дойдя до общего хендлера
+
+# 2. Потом обработчики с конкретными состояниями FSM
+@dp.message(SellerStates.waiting_phone)
+async def handle_waiting_phone(message: Message, state: FSMContext):
+    # Только для этого состояния
+    
+# 3. И только В САМОМ КОНЦЕ общий обработчик
+ @dp.message(F.chat.type == ChatType.PRIVATE)
+ async def handle_private_message(message: Message):
+    # Этот обработчик сработает ТОЛЬКО если предыдущие не сработали
+    await message_forwarder.forward_user_message(message.from_user.id, message)
+
 # ========== ОБРАБОТЧИК СООБЩЕНИЙ ОТ ПОЛЬЗОВАТЕЛЕЙ ==========
 @dp.message(F.chat.type == ChatType.PRIVATE)
 async def handle_private_message(message: Message):
-    """Обрабатывает все сообщения от пользователей в личных диалогах"""
-    user_id = message.from_user.id
+    """Обрабатывает все НЕ-командные сообщения от пользователей"""
     
-    # ПРОВЕРКА: Если сообщение - команда, пропускаем пересылку
+    # Если это команда - игнорируем (она обработается отдельно)
     if message.text and message.text.startswith('/'):
-        # Команды обрабатываются отдельно
-        return
+        return  # Пропускаем команды
     
-    # 1. Проверяем, настроена ли пересылка через MessageForwarder
+    # Если пользователь в состоянии FSM - тоже пропускаем
+    current_state = await dp.storage.get_state(user=message.from_user.id)
+    if current_state and current_state != "none":
+        return  # Состояния обрабатываются отдельными хендлерами
+    
+    # Только здесь логика пересылки
+    user_id = message.from_user.id
     channel_id = message_forwarder.get_user_channel(user_id)
     
     if channel_id:
-        # Пытаемся переслать сообщение
         result = await message_forwarder.forward_user_message(user_id, message)
+        # ... остальной код
         
         if result['success']:
             # Опционально: отправляем подтверждение пользователю
